@@ -26,9 +26,12 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import random
 import re
+import shutil
 import ssl
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -127,6 +130,9 @@ RE_SPACES = re.compile(r"[ \t]+")
 RE_LEADING_SPACE = re.compile(r"\n[ \t]+")
 RE_MULTI_NEWLINE = re.compile(r"\n{3,}")
 RE_WHITESPACE = re.compile(r"\s+")
+
+# w3m availability (checked once at import)
+W3M_PATH = shutil.which("w3m")
 
 # =============================================================================
 # REQUIRED DEPENDENCIES (managed by uv)
@@ -308,16 +314,54 @@ def is_navigation_line(line: str) -> bool:
     return any(line_lower.startswith(pattern) for pattern in NAVIGATION_PATTERNS)
 
 
-def extract_text(html: str) -> str:
-    """Extract readable text from HTML (fast version with noise filtering)."""
-    html = RE_STRIP_TAGS.sub("", html)
+_RE_BOILERPLATE = re.compile(
+    r"<(script|style|nav|footer|header|aside|noscript|iframe|svg|form)[^>]*>.*?</\1>",
+    re.DOTALL | re.IGNORECASE
+)
+# Common sidebar/menu class patterns
+_RE_NAV_DIVS = re.compile(
+    r'<div[^>]+(?:class|id)\s*=\s*"[^"]*(?:sidebar|sidenav|menu|toc|breadcrumb|nav-|topbar|cookie|banner|popup|modal)[^"]*"[^>]*>.*?</div>',
+    re.DOTALL | re.IGNORECASE
+)
+# Navigation lists: <ul> containing many <li><a> (menu/sidebar pattern)
+_RE_NAV_LISTS = re.compile(
+    r'<ul[^>]*>((?:\s*<li[^>]*>\s*<a[^>]*>.*?</a>\s*</li>\s*){5,})</ul>',
+    re.DOTALL | re.IGNORECASE
+)
+
+
+def _strip_boilerplate(html: str) -> Tuple[str, str]:
+    """Strip boilerplate tags and extract title. Returns (cleaned_html, title)."""
+    html = _RE_BOILERPLATE.sub("", html)
+    html = _RE_NAV_DIVS.sub("", html)
+    html = _RE_NAV_LISTS.sub("", html)
     html = RE_COMMENTS.sub("", html)
 
     title_match = RE_TITLE.search(html)
     raw_title = unescape(title_match.group(1).strip()) if title_match else ""
-    # Clean title: remove site name suffix (e.g., " | Site Name" or " - Site Name")
     title = re.sub(r'\s*[\|\-–—]\s*[^|\-–—]{3,50}$', '', raw_title) if raw_title else ""
 
+    return html, title
+
+
+def _extract_with_w3m(html: str) -> str:
+    """Render HTML to text using w3m."""
+    try:
+        result = subprocess.run(
+            [W3M_PATH, "-dump", "-T", "text/html", "-cols", "120", "-O", "utf-8"],
+            input=html.encode("utf-8", errors="replace"),
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.decode("utf-8", errors="replace")
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return ""
+
+
+def _extract_with_regex(html: str) -> str:
+    """Fallback: extract text from HTML using regex."""
     html = RE_BR.sub("\n", html)
     html = RE_BLOCK_END.sub("\n\n", html)
     html = RE_LI.sub("• ", html)
@@ -326,85 +370,45 @@ def extract_text(html: str) -> str:
     text = unescape(text)
     text = RE_SPACES.sub(" ", text)
     text = RE_LEADING_SPACE.sub("\n", text)
-    text = RE_MULTI_NEWLINE.sub("\n\n", text)
+    return RE_MULTI_NEWLINE.sub("\n\n", text)
 
-    # General noise filtering - pattern-based, not site-specific
+
+def extract_text(html: str) -> str:
+    """Extract readable text from HTML. Uses w3m if available, regex fallback."""
+    cleaned_html, title = _strip_boilerplate(html)
+
+    if W3M_PATH:
+        text = _extract_with_w3m(cleaned_html)
+        if not text:
+            text = _extract_with_regex(cleaned_html)
+    else:
+        text = _extract_with_regex(cleaned_html)
+
+    # Filter noise from extracted text
     lines = []
-    short_buffer: List[str] = []  # Buffer for consecutive short lines
     prev_line = ""
-    title_seen = False  # Track if we've seen the title to remove duplicates
+    title_seen = False
 
     for line in text.split("\n"):
         line = line.strip()
-
-        # Skip empty lines
         if not line:
             continue
-
-        # Skip navigation lines (Skip to content, Jump to, etc.)
         if is_navigation_line(line):
             continue
-
-        # Skip lines that are mostly repeated punctuation/symbols (nav remnants)
+        # Skip lines that are mostly symbols (nav remnants)
         alnum_count = sum(1 for c in line if c.isalnum())
         if len(line) > 3 and alnum_count / len(line) < 0.3:
             continue
-
-        # Skip lines with excessive repeated bullets/symbols anywhere
-        bullet_count = sum(1 for c in line if c in "•·●○◦‣⁃")
-        if bullet_count >= 4:
-            continue
-
-        # Skip lines that are just bullet/list markers
-        stripped = line.strip("•-*·►▸▹→‣⁃● ")
-        if not stripped or len(stripped) < 2:
-            continue
-
-        # Skip duplicate of previous line (common with titles)
         if line == prev_line:
             continue
-
-        # Skip duplicate title line (appears after # Title heading)
+        # Skip duplicate title
         if title and not title_seen:
-            # Check if line matches title (exact or without site suffix)
             line_normalized = re.sub(r'\s*[\|\-–—]\s*[^|\-–—]{3,50}$', '', line)
-            if line_normalized == title or line == raw_title:
+            if line_normalized == title:
                 title_seen = True
                 continue
-
-        # Skip very short lines that look like UI elements (1-2 words, no sentence structure)
-        words = line.split()
-        if len(line) < 15 and len(words) <= 2 and not line.startswith("#"):
-            # Check if it's a meaningful short phrase (has lowercase = likely sentence)
-            if not any(c.islower() for c in line):
-                continue
-
-        # Handle short lines - collapse consecutive ones
-        if len(line) < 25 and not line.startswith("#"):
-            short_buffer.append(line)
-            if len(short_buffer) >= 5:
-                # Join consecutive short lines
-                joined = " | ".join(short_buffer)
-                if len(joined) < 300:
-                    lines.append(joined)
-                short_buffer = []
-        else:
-            # Flush short buffer before adding long line
-            if short_buffer:
-                if len(short_buffer) <= 2:
-                    lines.extend(short_buffer)
-                else:
-                    lines.append(" | ".join(short_buffer))
-                short_buffer = []
-            lines.append(line)
-            prev_line = line
-
-    # Flush remaining short buffer
-    if short_buffer:
-        if len(short_buffer) <= 2:
-            lines.extend(short_buffer)
-        else:
-            lines.append(" | ".join(short_buffer))
+        lines.append(line)
+        prev_line = line
 
     text = "\n".join(lines)
     text = RE_MULTI_NEWLINE.sub("\n\n", text)
