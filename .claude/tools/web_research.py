@@ -35,7 +35,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from html import unescape
 from io import StringIO
@@ -536,6 +536,24 @@ def _extract_with_scrapling_fallback(page, min_length: int) -> str:
     return ""
 
 
+def _extract_content(raw_html: str) -> Tuple[str, str]:
+    """CPU-bound: extract text + JSON-LD from HTML. Runs in process pool."""
+    structured = extract_jsonld_metadata(raw_html)
+    content = extract_text(raw_html)
+    return content, structured
+
+
+# Shared process pool for CPU-bound text extraction (avoids blocking event loop)
+_extract_pool: Optional[ProcessPoolExecutor] = None
+
+
+def _get_extract_pool() -> ProcessPoolExecutor:
+    global _extract_pool
+    if _extract_pool is None:
+        _extract_pool = ProcessPoolExecutor(max_workers=4)
+    return _extract_pool
+
+
 async def fetch_single_async(
     url: str,
     timeout: int,
@@ -564,11 +582,11 @@ async def fetch_single_async(
                 progress.url_result(url, False, elapsed, "CAPTCHA/blocked")
             return FetchResult(url=url, success=False, error="CAPTCHA/blocked")
 
-        # Extract structured data (JSON-LD) — prepended to content
-        structured = extract_jsonld_metadata(raw_html)
-
-        # Primary extraction: w3m/regex
-        content = extract_text(raw_html)
+        # Extract text + JSON-LD in process pool (CPU-bound, don't block event loop)
+        loop = asyncio.get_event_loop()
+        content, structured = await loop.run_in_executor(
+            _get_extract_pool(), _extract_content, raw_html
+        )
 
         # Fallback: Scrapling's DOM parser when primary extraction is too short
         if len(content) < min_content_length:
@@ -631,8 +649,10 @@ async def fetch_stealth_async(
                 progress.url_result(url, False, elapsed, "Stealth still blocked")
             return FetchResult(url=url, success=False, error="Stealth still blocked", source="stealth")
 
-        structured = extract_jsonld_metadata(raw_html)
-        content = extract_text(raw_html)
+        loop = asyncio.get_event_loop()
+        content, structured = await loop.run_in_executor(
+            _get_extract_pool(), _extract_content, raw_html
+        )
         if len(content) < min_content_length:
             scrapling_content = _extract_with_scrapling_fallback(page, min_content_length)
             if scrapling_content:
