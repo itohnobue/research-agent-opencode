@@ -1014,6 +1014,7 @@ Examples:
   python web_research.py "AI trends 2025" --fetch 50
   python web_research.py "Python best practices" -o markdown
   python web_research.py "query" --stream  # Stream output as results arrive
+  python web_research.py "query1" "query2" "query3"  # Parallel multi-query
 
 Search: DDG primary + Brave fallback (set BRAVE_API_KEY env var or ~/.config/brave/api_key)
 Fetch: Scrapling AsyncFetcher (TLS fingerprinting) + StealthyFetcher retry
@@ -1022,7 +1023,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
         """
     )
 
-    parser.add_argument("query", help="Search query")
+    parser.add_argument("query", nargs="+", help="Search query (multiple queries run in parallel)")
     parser.add_argument("-s", "--search", type=int, default=20,
                         help="Number of search results (default: 20)")
     parser.add_argument("-f", "--fetch", type=int, default=0,
@@ -1049,29 +1050,64 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
     if args.verbose:
         logger.setLevel(logging.DEBUG)
 
-    config = ResearchConfig(
-        query=args.query,
-        fetch_count=args.fetch,
-        max_content_length=args.max_length,
-        timeout=args.timeout,
-        quiet=args.quiet,
-        max_concurrent=args.concurrent,
-        search_results=args.search,
-        stream=args.stream,
-        no_stealth=args.no_stealth,
-    )
+    queries = args.query
+
+    def make_config(query: str) -> ResearchConfig:
+        return ResearchConfig(
+            query=query,
+            fetch_count=args.fetch,
+            max_content_length=args.max_length,
+            timeout=args.timeout,
+            quiet=args.quiet,
+            max_concurrent=args.concurrent,
+            search_results=args.search,
+            stream=args.stream,
+            no_stealth=args.no_stealth,
+        )
 
     try:
-        if args.stream:
-            run_research(config, verbose=args.verbose)
+        if len(queries) == 1:
+            # Single query: original behavior
+            config = make_config(queries[0])
+            if args.stream:
+                run_research(config, verbose=args.verbose)
+            else:
+                results = run_research(config, verbose=args.verbose)
+                if results:
+                    if args.output == "json":
+                        print(format_batch_json(results, config.query))
+                    elif args.output == "markdown":
+                        print(format_batch_markdown(results, config.query, config.max_content_length))
+                    else:
+                        print(format_batch_raw(results))
         else:
-            results = run_research(config, verbose=args.verbose)
-            if results:
+            # Multi-query: run all in parallel
+            configs = [make_config(q) for q in queries]
+
+            async def run_all():
+                async def run_one(cfg: ResearchConfig) -> Tuple[str, List[FetchResult]]:
+                    progress = ProgressReporter(quiet=cfg.quiet, verbose=args.verbose)
+                    results: List[FetchResult] = []
+                    async for result in run_research_async(cfg, progress):
+                        results.append(result)
+                    return cfg.query, results
+
+                return await asyncio.gather(*(run_one(c) for c in configs))
+
+            all_results = asyncio.run(run_all())
+
+            for query, results in all_results:
+                if not results:
+                    continue
                 if args.output == "json":
-                    print(format_batch_json(results, config.query))
+                    print(format_batch_json(results, query))
                 elif args.output == "markdown":
-                    print(format_batch_markdown(results, config.query, config.max_content_length))
+                    print(format_batch_markdown(results, query, args.max_length))
                 else:
+                    if len(queries) > 1:
+                        print(f"\n{'='*60}")
+                        print(f"QUERY: {query}")
+                        print(f"{'='*60}\n")
                     print(format_batch_raw(results))
 
     except KeyboardInterrupt:
