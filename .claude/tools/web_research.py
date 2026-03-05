@@ -798,10 +798,10 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Max content length per page (default: 4000)")
     parser.add_argument("-o", "--output", choices=["json", "raw", "markdown"], default="raw",
                         help="Output format (default: raw)")
-    parser.add_argument("-t", "--timeout", type=int, default=20,
-                        help="Fetch timeout in seconds (default: 20)")
-    parser.add_argument("-c", "--concurrent", type=int, default=10,
-                        help="Max concurrent connections (default: 10)")
+    parser.add_argument("-t", "--timeout", type=int, default=10,
+                        help="Fetch timeout in seconds (default: 10)")
+    parser.add_argument("-c", "--concurrent", type=int, default=20,
+                        help="Max concurrent connections (default: 20)")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="Suppress progress messages")
     parser.add_argument("-v", "--verbose", action="store_true",
