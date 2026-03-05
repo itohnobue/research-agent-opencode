@@ -552,9 +552,8 @@ async def fetch_single_async(
 
         raw_html = page.html_content
         if len(raw_html) > MAX_CONTENT_BYTES:
-            if progress:
-                progress.url_result(url, False, elapsed, "Too large")
-            return FetchResult(url=url, success=False, error="Too large")
+            # Truncate HTML but still try to extract text
+            raw_html = raw_html[:MAX_CONTENT_BYTES]
 
         if is_blocked_content(raw_html):
             if progress:
