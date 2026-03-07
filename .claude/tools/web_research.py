@@ -133,6 +133,9 @@ RE_SPACES = re.compile(r"[ \t]+")
 RE_LEADING_SPACE = re.compile(r"\n[ \t]+")
 RE_MULTI_NEWLINE = re.compile(r"\n{3,}")
 RE_WHITESPACE = re.compile(r"\s+")
+# Sentence boundary: period/exclamation/question + space + uppercase letter
+# Handles common abbreviations by requiring 2+ chars before the period
+RE_SENT_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-Z])')
 
 # External tool availability (checked once at import)
 PDFTOTEXT_PATH = shutil.which("pdftotext")
@@ -555,53 +558,75 @@ def extract_jsonld_metadata(html: str) -> str:
 # URL FETCHER (Scrapling-based)
 # =============================================================================
 
+def _split_sentences(text: str) -> List[str]:
+    """Split text into sentences. Two-level: split on newlines, then on sentence boundaries."""
+    sentences: List[str] = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        # Short lines (headings, list items) stay as-is
+        if len(line) < 150:
+            sentences.append(line)
+        else:
+            # Split long lines on sentence boundaries
+            parts = RE_SENT_SPLIT.split(line)
+            sentences.extend(p.strip() for p in parts if p.strip())
+    return sentences
+
+
 def _compress_with_bm25(content: str, query: str, max_length: int) -> str:
-    """Query-focused extraction: keep paragraphs most relevant to query via BM25."""
+    """Query-focused extraction: keep sentences most relevant to query via BM25."""
     from rank_bm25 import BM25Okapi
 
-    # Split into paragraphs, preserve title/meta header
-    lines = content.split("\n\n")
+    # Split into paragraphs first to identify headers
+    blocks = content.split("\n\n")
     header_parts: List[str] = []
-    body_parts: List[str] = []
-    for line in lines:
-        stripped = line.strip()
+    body_text_parts: List[str] = []
+    for block in blocks:
+        stripped = block.strip()
         if not stripped:
             continue
-        # Keep title and metadata at the top unconditionally
-        if not body_parts and (stripped.startswith("# ") or stripped.startswith("[meta")):
+        if not body_text_parts and (stripped.startswith("# ") or stripped.startswith("[meta")):
             header_parts.append(stripped)
         else:
-            body_parts.append(stripped)
+            body_text_parts.append(stripped)
 
-    if not body_parts:
+    if not body_text_parts:
         return content[:max_length]
 
-    # BM25 rank body paragraphs by query relevance
-    tokenized = [p.lower().split() for p in body_parts]
+    # Split body into sentences for granular selection
+    body_text = "\n\n".join(body_text_parts)
+    sentences = _split_sentences(body_text)
+
+    if not sentences:
+        return content[:max_length]
+
+    # BM25 rank sentences by query relevance
+    tokenized = [s.lower().split() for s in sentences]
     bm25 = BM25Okapi(tokenized)
     scores = bm25.get_scores(query.lower().split())
 
-    # Keep all paragraphs with positive score, ranked by score, up to budget
-    ranked = sorted(zip(scores, range(len(body_parts)), body_parts), reverse=True)
+    # Select top-scoring sentences within budget
+    ranked = sorted(zip(scores, range(len(sentences)), sentences), reverse=True)
     budget = max_length - sum(len(h) + 2 for h in header_parts)
     selected: List[Tuple[int, str]] = []  # (original_index, text)
     chars = 0
-    for score, idx, para in ranked:
+    for score, idx, sent in ranked:
         if score <= 0 or chars >= budget:
             break
-        selected.append((idx, para))
-        chars += len(para) + 2
+        selected.append((idx, sent))
+        chars += len(sent) + 1
 
     if not selected:
-        # No query matches — fall back to head truncation
         return content[:max_length]
 
-    # Restore original order so the text reads naturally
+    # Restore original order
     selected.sort(key=lambda x: x[0])
-    parts = header_parts + [para for _, para in selected]
-    result = "\n\n".join(parts)
+    parts = header_parts + [sent for _, sent in selected]
+    result = "\n".join(parts)
     if chars >= budget:
-        result += "\n\n[Compressed...]"
+        result += "\n[Compressed...]"
     return result
 
 
@@ -1115,6 +1140,65 @@ async def run_research_async(
 
 
 # =============================================================================
+# CROSS-PAGE DEDUPLICATION
+# =============================================================================
+
+def _normalize_sentence(s: str) -> str:
+    """Normalize a sentence for dedup comparison: lowercase, strip punctuation, collapse whitespace."""
+    s = s.lower().strip()
+    s = re.sub(r'[^\w\s]', '', s)
+    return RE_WHITESPACE.sub(' ', s)
+
+
+def _dedup_results(results: List[FetchResult], seen: Optional[Set[str]] = None) -> List[FetchResult]:
+    """Remove duplicate sentences across pages. Earlier pages take priority.
+    Pass a shared `seen` set to dedup across multiple calls (e.g. multi-query)."""
+    if seen is None:
+        seen = set()
+    deduped: List[FetchResult] = []
+
+    for r in results:
+        if not r.success:
+            deduped.append(r)
+            continue
+
+        lines = r.content.split("\n")
+        kept: List[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                kept.append(line)
+                continue
+            # Always keep headers and metadata
+            if stripped.startswith("# ") or stripped.startswith("[meta"):
+                kept.append(line)
+                continue
+            # Skip very short lines (not worth deduping)
+            if len(stripped) < 40:
+                kept.append(line)
+                continue
+            norm = _normalize_sentence(stripped)
+            if norm in seen:
+                continue  # duplicate — skip
+            seen.add(norm)
+            kept.append(line)
+
+        new_content = "\n".join(kept).strip()
+        if len(new_content) < 50:
+            # Page reduced to nothing after dedup — drop it
+            continue
+        deduped.append(FetchResult(
+            url=r.url,
+            success=True,
+            content=new_content,
+            title=r.title,
+            source=r.source,
+        ))
+
+    return deduped
+
+
+# =============================================================================
 # BATCH OUTPUT FORMATTERS (for non-streaming mode)
 # =============================================================================
 
@@ -1362,6 +1446,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                     **_quality_fields(results),
                 })
                 if results:
+                    results = _dedup_results(results)
                     if args.output == "json":
                         print(format_batch_json(results, config.query))
                     elif args.output == "markdown":
@@ -1406,6 +1491,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                 sys.exit(1)
 
             elapsed = int((time.monotonic() - t0_multi) * 1000)
+            dedup_seen: Set[str] = set()  # shared across queries
             for query, results in all_results:
                 ok = [r for r in results if r.success]
                 log_usage({
@@ -1418,6 +1504,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                 })
                 if not results:
                     continue
+                results = _dedup_results(results, seen=dedup_seen)
                 if args.output == "json":
                     print(format_batch_json(results, query))
                 elif args.output == "markdown":
