@@ -605,15 +605,45 @@ def _compress_with_bm25(content: str, query: str, max_length: int) -> str:
     # BM25 rank sentences by query relevance
     tokenized = [s.lower().split() for s in sentences]
     bm25 = BM25Okapi(tokenized)
-    scores = bm25.get_scores(query.lower().split())
+    bm25_scores = bm25.get_scores(query.lower().split())
+
+    # Centrality scoring: sentences similar to many others are "hub" sentences
+    # (captures important context that BM25 misses when it lacks query terms)
+    word_sets = [set(t) for t in tokenized]
+    n = len(sentences)
+    centrality = [0.0] * n
+    if n > 1:
+        for i in range(n):
+            if not word_sets[i]:
+                continue
+            total_sim = 0.0
+            for j in range(n):
+                if i == j or not word_sets[j]:
+                    continue
+                # Jaccard similarity
+                intersection = len(word_sets[i] & word_sets[j])
+                union = len(word_sets[i] | word_sets[j])
+                if union:
+                    total_sim += intersection / union
+            centrality[i] = total_sim / (n - 1)
+
+    # Blend: 70% BM25 relevance + 30% centrality importance
+    max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1.0
+    max_cent = max(centrality) if max(centrality) > 0 else 1.0
+    scores = [
+        0.7 * (b / max_bm25) + 0.3 * (c / max_cent)
+        for b, c in zip(bm25_scores, centrality)
+    ]
 
     # Select top-scoring sentences within budget
     ranked = sorted(zip(scores, range(len(sentences)), sentences), reverse=True)
     budget = max_length - sum(len(h) + 2 for h in header_parts)
     selected: List[Tuple[int, str]] = []  # (original_index, text)
     chars = 0
+    # Minimum score threshold: at least 10% of max blended score
+    min_score = 0.1
     for score, idx, sent in ranked:
-        if score <= 0 or chars >= budget:
+        if score < min_score or chars >= budget:
             break
         selected.append((idx, sent))
         chars += len(sent) + 1
@@ -877,6 +907,15 @@ def _load_brave_api_key() -> Optional[str]:
         return None
 
 
+def _snippet_relevance(query: str, title: str, snippet: str) -> float:
+    """Score snippet relevance to query by word overlap. Returns 0.0-1.0."""
+    query_words = set(query.lower().split())
+    text_words = set((title + " " + snippet).lower().split())
+    if not query_words:
+        return 1.0
+    return len(query_words & text_words) / len(query_words)
+
+
 class BraveSearch:
     """Brave Search API backend."""
 
@@ -887,8 +926,8 @@ class BraveSearch:
         self,
         query: str,
         num_results: int = 20,
-    ) -> Iterator[Tuple[str, str]]:
-        """Search Brave and yield (url, title) tuples."""
+    ) -> Iterator[Tuple[str, str, str]]:
+        """Search Brave and yield (url, title, snippet) tuples."""
         import urllib.request
 
         encoded = urllib.parse.quote_plus(query)
@@ -907,7 +946,7 @@ class BraveSearch:
                 result_url = r.get("url", "")
                 if result_url and result_url not in seen_urls and is_valid_url(result_url) and not is_blocked_url(result_url):
                     seen_urls.add(result_url)
-                    yield result_url, r.get("title", "")
+                    yield result_url, r.get("title", ""), r.get("description", "")
                     count += 1
                     if count >= num_results:
                         return
@@ -923,11 +962,8 @@ class DuckDuckGoSearch:
         self,
         query: str,
         num_results: int = 50,
-    ) -> Iterator[Tuple[str, str]]:
-        """
-        Search DuckDuckGo and yield (url, title) tuples.
-        Filters blocked URLs during iteration.
-        """
+    ) -> Iterator[Tuple[str, str, str]]:
+        """Search DuckDuckGo and yield (url, title, snippet) tuples."""
         seen_urls: Set[str] = set()
         count = 0
 
@@ -936,7 +972,7 @@ class DuckDuckGoSearch:
             url = r.get("href", "")
             if url and url not in seen_urls and is_valid_url(url) and not is_blocked_url(url):
                 seen_urls.add(url)
-                yield url, r.get("title", "")
+                yield url, r.get("title", ""), r.get("body", "")
                 count += 1
                 if count >= num_results:
                     return
@@ -952,27 +988,27 @@ class MultiSearch:
         self,
         query: str,
         num_results: int = 20,
-    ) -> Iterator[Tuple[str, str]]:
+    ) -> Iterator[Tuple[str, str, str]]:
         """Search DDG first. If under target, supplement with Brave."""
         seen_urls: Set[str] = set()
         count = 0
 
         # Phase 1: DuckDuckGo (primary)
         ddg = DuckDuckGoSearch()
-        for url, title in ddg.search(query, num_results):
+        for url, title, snippet in ddg.search(query, num_results):
             if url not in seen_urls:
                 seen_urls.add(url)
-                yield url, title
+                yield url, title, snippet
                 count += 1
 
         # Phase 2: Brave (supplement if DDG fell short)
         shortfall = num_results - count
         if shortfall > 0 and self._brave_key:
             brave = BraveSearch(self._brave_key)
-            for url, title in brave.search(query, shortfall + 5):  # request extra to account for dupes
+            for url, title, snippet in brave.search(query, shortfall + 5):
                 if url not in seen_urls:
                     seen_urls.add(url)
-                    yield url, title
+                    yield url, title, snippet
                     count += 1
                     if count >= num_results:
                         return
@@ -1041,18 +1077,24 @@ async def run_research_async(
 
         def search_and_stream():
             nonlocal ddg_count, brave_count
-            prev_count = 0
-            for url, title in searcher.search(config.query, config.search_results):
+            enqueued = 0
+            skipped = 0
+            for url, title, snippet in searcher.search(config.query, config.search_results):
                 if global_seen_urls is not None:
                     if url in global_seen_urls:
                         continue
                     global_seen_urls.add(url)
                 urls.append(url)
                 stats.urls_searched = len(urls)
+                # Snippet relevance gate: skip URLs with zero query word overlap
+                # Always enqueue at least 5 URLs (safety net for edge cases)
+                relevance = _snippet_relevance(config.query, title, snippet)
+                if relevance == 0 and enqueued >= 5:
+                    skipped += 1
+                    continue
                 loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
+                enqueued += 1
 
-            # Count sources (DDG fills first, Brave supplements)
-            # We can't easily distinguish here, but MultiSearch logs internally
             ddg_count = len(urls)
 
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -1064,6 +1106,8 @@ async def run_research_async(
             source_info += " (DDG+Brave)"
         else:
             source_info += " (DDG)"
+        if skipped:
+            source_info += f", {skipped} filtered"
         progress.message(f"  [search] {source_info} in {search_elapsed:.1f}s")
         await fetch_queue.put(None)
 
