@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["scrapling[fetchers]", "ddgs", "trafilatura"]
+# dependencies = ["scrapling[fetchers]", "ddgs", "trafilatura", "rank-bm25"]
 # ///
 # -*- coding: utf-8 -*-
 """
@@ -555,16 +555,70 @@ def extract_jsonld_metadata(html: str) -> str:
 # URL FETCHER (Scrapling-based)
 # =============================================================================
 
+def _compress_with_bm25(content: str, query: str, max_length: int) -> str:
+    """Query-focused extraction: keep paragraphs most relevant to query via BM25."""
+    from rank_bm25 import BM25Okapi
+
+    # Split into paragraphs, preserve title/meta header
+    lines = content.split("\n\n")
+    header_parts: List[str] = []
+    body_parts: List[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Keep title and metadata at the top unconditionally
+        if not body_parts and (stripped.startswith("# ") or stripped.startswith("[meta")):
+            header_parts.append(stripped)
+        else:
+            body_parts.append(stripped)
+
+    if not body_parts:
+        return content[:max_length]
+
+    # BM25 rank body paragraphs by query relevance
+    tokenized = [p.lower().split() for p in body_parts]
+    bm25 = BM25Okapi(tokenized)
+    scores = bm25.get_scores(query.lower().split())
+
+    # Keep all paragraphs with positive score, ranked by score, up to budget
+    ranked = sorted(zip(scores, range(len(body_parts)), body_parts), reverse=True)
+    budget = max_length - sum(len(h) + 2 for h in header_parts)
+    selected: List[Tuple[int, str]] = []  # (original_index, text)
+    chars = 0
+    for score, idx, para in ranked:
+        if score <= 0 or chars >= budget:
+            break
+        selected.append((idx, para))
+        chars += len(para) + 2
+
+    if not selected:
+        # No query matches — fall back to head truncation
+        return content[:max_length]
+
+    # Restore original order so the text reads naturally
+    selected.sort(key=lambda x: x[0])
+    parts = header_parts + [para for _, para in selected]
+    result = "\n\n".join(parts)
+    if chars >= budget:
+        result += "\n\n[Compressed...]"
+    return result
+
+
 def _create_fetch_result(
     url: str,
     content: Optional[str],
     min_length: int,
-    max_length: int
+    max_length: int,
+    query: str = "",
 ) -> FetchResult:
     """Create FetchResult from content, applying length checks and truncation."""
     if content and len(content) >= min_length:
         if len(content) > max_length:
-            content = content[:max_length] + "\n\n[Truncated...]"
+            if query:
+                content = _compress_with_bm25(content, query, max_length)
+            else:
+                content = content[:max_length] + "\n\n[Truncated...]"
         return FetchResult(
             url=url,
             success=True,
@@ -650,7 +704,8 @@ async def fetch_single_async(
     timeout: int,
     min_content_length: int,
     max_content_length: int,
-    progress: Optional[ProgressReporter] = None
+    progress: Optional[ProgressReporter] = None,
+    query: str = "",
 ) -> FetchResult:
     """Fetch single URL using Scrapling's AsyncFetcher (TLS fingerprinting)."""
     t0 = time.monotonic()
@@ -679,7 +734,7 @@ async def fetch_single_async(
                 if progress:
                     progress.url_result(url, False, elapsed, "PDF extraction failed")
                 return FetchResult(url=url, success=False, error="PDF extraction failed")
-            result = _create_fetch_result(url, content, min_content_length, max_content_length)
+            result = _create_fetch_result(url, content, min_content_length, max_content_length, query=query)
             if progress:
                 progress.url_result(url, result.success, elapsed, result.error or "")
             return result
@@ -705,7 +760,7 @@ async def fetch_single_async(
         if structured:
             content = structured + content
 
-        result = _create_fetch_result(url, content, min_content_length, max_content_length)
+        result = _create_fetch_result(url, content, min_content_length, max_content_length, query=query)
         if progress:
             progress.url_result(url, result.success, elapsed, result.error or "")
         return result
@@ -734,7 +789,8 @@ async def fetch_stealth_async(
     url: str,
     min_content_length: int,
     max_content_length: int,
-    progress: Optional[ProgressReporter] = None
+    progress: Optional[ProgressReporter] = None,
+    query: str = "",
 ) -> FetchResult:
     """Fetch a single URL using StealthyFetcher (headless browser with anti-bot bypass)."""
     t0 = time.monotonic()
@@ -767,7 +823,7 @@ async def fetch_stealth_async(
         if structured:
             content = structured + content
 
-        result = _create_fetch_result(url, content, min_content_length, max_content_length)
+        result = _create_fetch_result(url, content, min_content_length, max_content_length, query=query)
         result.source = "stealth"
         if progress:
             progress.url_result(url, result.success, elapsed, result.error or "")
@@ -996,7 +1052,7 @@ async def run_research_async(
                 result = await fetch_single_async(
                     url, config.timeout,
                     config.min_content_length, config.max_content_length,
-                    progress=progress
+                    progress=progress, query=config.query,
                 )
                 await result_queue.put(result)
 
@@ -1042,7 +1098,7 @@ async def run_research_async(
         progress.phase_start("stealth")
 
         stealth_results = await asyncio.gather(*(
-            fetch_stealth_async(url, config.min_content_length, config.max_content_length, progress=progress)
+            fetch_stealth_async(url, config.min_content_length, config.max_content_length, progress=progress, query=config.query)
             for url in retry_urls
         ))
 
