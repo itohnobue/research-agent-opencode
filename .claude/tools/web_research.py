@@ -136,6 +136,23 @@ RE_WHITESPACE = re.compile(r"\s+")
 # Sentence boundary: period/exclamation/question + space + uppercase letter
 # Handles common abbreviations by requiring 2+ chars before the period
 RE_SENT_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-Z])')
+# Forum noise: lines that are pure metadata (likes, timestamps, user roles)
+RE_FORUM_NOISE = re.compile(
+    r'^\s*(?:'
+    r'\d+\s+Likes?\b'               # "1 Like", "2 Likes"
+    r'|Like\s*$'                     # standalone "Like"
+    r'|\d+\s*(?:yr|mo|hr|min|sec)s?\s+ago\b'  # "2 yr ago"
+    r'|(?:Community\s+Expert|Author|Moderator|Admin)\s*$'  # user roles
+    r'|(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\d*\s*(?:yr|mo)?\s*$'  # "March 19, 20232 yr"
+    r'|\d{1,2}\s+(?:hours?|minutes?|days?|weeks?|months?|years?)\s+ago'  # "8 hours ago"
+    r'|said:\s*$'                    # "X said:"
+    r'|Quote\s*$'                    # standalone "Quote"
+    r'|Share\s*$'                    # standalone "Share"
+    r'|Reply\s*$'                    # standalone "Reply"
+    r'|Report\s*$'                   # standalone "Report"
+    r')',
+    re.MULTILINE | re.IGNORECASE,
+)
 
 # External tool availability (checked once at import)
 PDFTOTEXT_PATH = shutil.which("pdftotext")
@@ -484,6 +501,9 @@ def extract_text(html: str) -> str:
         title = ""
 
     text = text.strip()
+    # Strip forum noise lines (likes, timestamps, user roles)
+    text = RE_FORUM_NOISE.sub("", text)
+    text = RE_MULTI_NEWLINE.sub("\n\n", text)
     # Prepend title if not already present
     if title and not text.startswith(f"# {title}"):
         text = f"# {title}\n\n{text}"
@@ -1457,6 +1477,10 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
         print_usage_stats(quality=args.quality)
         sys.exit(0)
 
+    # JSON output must not have progress messages mixed in (agents parse stdout)
+    if args.output == "json":
+        args.quiet = True
+
     if args.verbose:
         logger.setLevel(logging.DEBUG)
 
@@ -1572,6 +1596,9 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         print(format_batch_markdown(results, config.query, config.max_content_length))
                     else:
                         print(format_batch_raw(results))
+                else:
+                    print("No results found", file=sys.stderr)
+                    sys.exit(1)
         else:
             # Multi-query: run all in parallel
             configs = [make_config(q) for q in queries]
