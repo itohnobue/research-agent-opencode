@@ -1560,8 +1560,9 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
         print(f"\nwall-clock timeout ({_WALL_TIMEOUT}s) — exiting", file=sys.stderr)
         os._exit(1)  # kills child processes (ProcessPoolExecutor workers)
     _WALL_TIMEOUT = 300
-    signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(_WALL_TIMEOUT)
+    if hasattr(signal, 'SIGALRM'):
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(_WALL_TIMEOUT)
 
     try:
         if len(queries) == 1:
