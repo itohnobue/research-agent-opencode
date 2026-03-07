@@ -611,7 +611,13 @@ def extract_jsonld_metadata(html: str) -> str:
 
         # FAQPage: Q&A pairs are genuinely hard to extract from rendered HTML
         if ld_type == "FAQPage":
-            for entity in data.get("mainEntity", [])[:5]:
+            entities = data.get("mainEntity", [])
+            # Flatten nested lists (e.g. AWS uses [[{...}, {...}]])
+            if entities and isinstance(entities[0], list):
+                entities = [e for sub in entities for e in sub]
+            for entity in entities[:5]:
+                if not isinstance(entity, dict):
+                    continue
                 q = entity.get("name", "")
                 a_obj = entity.get("acceptedAnswer", {})
                 a = a_obj.get("text", "") if isinstance(a_obj, dict) else ""
@@ -707,7 +713,10 @@ def _extract_pdf(raw_bytes: bytes) -> str:
 
 def _extract_content(raw_html: str) -> Tuple[str, str]:
     """CPU-bound: extract text + JSON-LD from HTML. Runs in process pool."""
-    structured = extract_jsonld_metadata(raw_html)
+    try:
+        structured = extract_jsonld_metadata(raw_html)
+    except Exception:
+        structured = ""
     content = extract_text(raw_html)
     return content, structured
 
