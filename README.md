@@ -8,7 +8,7 @@ A web search agent for Claude Code (or any LLM) that processes 50+ results per s
 2. **Add instructions**: Copy `CLAUDE.md` contents into your project's instruction file
 3. **Test it**: Ask Claude to search the web, e.g., *"Search for most beautiful Hokusai paintings and explain why they're great"*
 
-The wrapper scripts auto-install **uv**, which handles Python and dependencies.
+Wrapper scripts: `web_search.sh` (Linux/macOS) and `web_search.bat` (Windows). They auto-install **uv**, which handles Python and dependencies.
 
 ## Why You Need This
 
@@ -52,17 +52,17 @@ Without Brave, DDG is used exclusively (still works well).
 
 ## Diagnostics
 
-Default output (stderr) shows timing at each phase:
+Default output (stderr) shows a live progress line and summary:
 
 ```
 Researching: "Python asyncio tutorial"
   [search] 10 URLs (DDG+Brave) in 1.7s
     fetch: 10/10 (9 ok, 2s)
-  Done: 9/10 ok (35,567 chars) in 2.6s
+  Done: 9/10 ok (90%) -- 35,567 chars in 2.6s
   Skipped: 1 HTTP 403
 ```
 
-With `-v` (verbose), you see every URL individually:
+With `-v` (verbose), each URL prints its own status line instead of the progress counter:
 
 ```
 Researching: "Python asyncio tutorial"
@@ -71,21 +71,24 @@ Researching: "Python asyncio tutorial"
     OK   0.4s  blog.apify.com
     OK   0.5s  docs.python.org
     OK   1.6s  www.lambdatest.com
-  Done: 9/10 ok (35,567 chars) in 2.6s
+  Done: 9/10 ok (90%) -- 35,567 chars in 2.6s
   Skipped: 1 HTTP 403
 ```
 
-Slow URLs (>5s) are always listed in the summary, even without `-v`.
+Slow URLs (>5s) are always listed in the summary, even without `-v`. Low success rates get flagged (`!` below 70%, `!! LOW` below 50%).
 
 ## Options
 
 ```
 -s N          Number of search results (default: 20)
--f N          Max pages to fetch (default: 10)
+-f N          Max pages to fetch (default: 0 = all)
 -m N          Max chars per page (default: 8000)
--o FORMAT     Output format: text (default), json, raw, markdown
+-o FORMAT     Output format: raw (default), json, markdown
 -v            Verbose: show per-URL timing
---url URL ... Direct URL fetch (skip search)
+-q            Quiet: suppress progress messages
+-t N          Fetch timeout in seconds (default: 5)
+-c N          Max concurrent connections (default: 50)
+-u URL ...    Direct URL fetch (skip search)
 --stream      Stream results as they arrive
 --no-stealth  Disable headless browser retry for blocked pages
 --usage       Show usage statistics (last 30 days)
@@ -102,11 +105,10 @@ web_search.sh "query1" "query2" "query3" -s 10
 
 ## Direct URL Fetch
 
-Fetch specific URLs without searching (also available via `scrape.sh`):
+Fetch specific URLs without searching:
 
 ```bash
-web_search.sh --url https://example.com https://other.com
-scrape.sh https://example.com   # shorthand
+web_search.sh -u https://example.com https://other.com
 ```
 
 ## Compression Pipeline
