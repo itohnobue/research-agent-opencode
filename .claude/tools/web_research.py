@@ -60,10 +60,27 @@ logging.getLogger().setLevel(logging.CRITICAL)
 for _lib in ("scrapling", "curl_cffi", "httpx", "hpack", "httpcore", "asyncio"):
     logging.getLogger(_lib).setLevel(logging.CRITICAL)
 
+# Suppress curl-cffi C-level warnings (e.g. "Impersonate 'chrome_100' does not exist")
+# These are printed directly to stderr from the compiled extension, not via logging/warnings.
+_real_stderr = sys.stderr
+class _StderrFilter:
+    """Filter out curl-cffi impersonate warnings from stderr."""
+    def write(self, msg):
+        if "does not exist" in msg and "mpersonate" in msg:
+            return len(msg)
+        return _real_stderr.write(msg)
+    def flush(self):
+        _real_stderr.flush()
+    def fileno(self):
+        return _real_stderr.fileno()
+    def __getattr__(self, name):
+        return getattr(_real_stderr, name)
+sys.stderr = _StderrFilter()
+
 # Our own logger — restored to WARNING after imports
 logger = logging.getLogger("web_research")
 logger.setLevel(logging.WARNING)
-_handler = logging.StreamHandler(sys.stderr)
+_handler = logging.StreamHandler(_real_stderr)
 _handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
 logger.addHandler(_handler)
 logger.propagate = False
