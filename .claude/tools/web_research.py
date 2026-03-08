@@ -1659,6 +1659,58 @@ def _dedup_results(
     return deduped, stats
 
 
+def _gemini_summarize(text: str, query: str, progress: Optional['ProgressReporter'] = None) -> str:
+    """Summarize search results via Gemini Flash API. Returns summary or original text on failure."""
+    import urllib.request
+
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        # Try reading from config file
+        key_path = Path.home() / ".config" / "gemini" / "api_key"
+        if key_path.exists():
+            api_key = key_path.read_text().strip()
+    if not api_key:
+        if progress:
+            progress.message("  [summarize] no GEMINI_API_KEY, skipping")
+        return text
+
+    prompt = (
+        "Summarize these web search results for the query: " + json.dumps(query) + "\n"
+        "Keep ALL specific technical details, version numbers, feature names, "
+        "benchmarks, code examples, and URLs of sources. "
+        "Remove fluff, intros, outros, repetition across pages, and promotional content. "
+        "Output a dense, factual summary.\n\n" + text
+    )
+
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 8192, "temperature": 0.1},
+    }).encode()
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+        summary = data["candidates"][0]["content"]["parts"][0]["text"]
+        # Strip Gemini's occasional massive whitespace padding in tables
+        summary = re.sub(r' {10,}', ' ', summary)
+        elapsed = time.monotonic() - t0
+        if progress:
+            progress.message(
+                f"  [summarize] {len(text):,} → {len(summary):,} chars "
+                f"({len(text)/len(summary):.1f}x) in {elapsed:.1f}s"
+            )
+        return summary
+    except Exception as e:
+        elapsed = time.monotonic() - t0
+        if progress:
+            progress.message(f"  [summarize] failed after {elapsed:.1f}s: {e}")
+        return text
+
+
 def _global_compress(
     results: List[FetchResult],
     query: str,
@@ -1889,6 +1941,8 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Global char budget across all pages (0 = unlimited)")
     parser.add_argument("--no-stealth", action="store_true",
                         help="Disable stealth browser retry for blocked pages")
+    parser.add_argument("-S", "--summarize", action="store_true",
+                        help="Summarize results via Gemini Flash (reduces output ~10x)")
     parser.add_argument("--usage", action="store_true",
                         help="Show usage statistics (last 30 days)")
     parser.add_argument("--quality", action="store_true",
@@ -2020,7 +2074,11 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                     elif args.output == "markdown":
                         print(format_batch_markdown(results, config.query, config.max_content_length))
                     else:
-                        print(format_batch_raw(results))
+                        raw = format_batch_raw(results)
+                        if args.summarize:
+                            progress = ProgressReporter(quiet=args.quiet, verbose=args.verbose)
+                            raw = _gemini_summarize(raw, config.query, progress)
+                        print(raw)
                 else:
                     print("No results found", file=sys.stderr)
                     sys.exit(1)
@@ -2088,7 +2146,11 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         print(f"\n{'='*60}")
                         print(f"QUERY: {query}")
                         print(f"{'='*60}\n")
-                    print(format_batch_raw(results))
+                    raw = format_batch_raw(results)
+                    if args.summarize:
+                        progress = ProgressReporter(quiet=args.quiet, verbose=args.verbose)
+                        raw = _gemini_summarize(raw, query, progress)
+                    print(raw)
 
     except KeyboardInterrupt:
         print("\nInterrupted", file=sys.stderr)
