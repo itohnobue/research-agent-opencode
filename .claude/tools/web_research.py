@@ -136,6 +136,11 @@ RE_WHITESPACE = re.compile(r"\s+")
 # Sentence boundary: period/exclamation/question + space + uppercase letter
 # Handles common abbreviations by requiring 2+ chars before the period
 RE_SENT_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-Z])')
+# Wikipedia cleanup patterns
+RE_WIKI_CITE = re.compile(r'\[\[?\d+\]?\](?:\(#cite_note[^)]*\))?')  # [[20]](#cite_note-22), [21]
+RE_WIKI_CITE_NAMED = re.compile(r'\[\[?[a-z]\]?\](?:\(#cite_note[^)]*\))?')  # [[b]](#cite_note-b-13)
+RE_WIKI_LINK = re.compile(r'\[([^\]]+)\]\(/wiki/[^)]+\)')  # [Battle](/wiki/Battle) -> Battle
+RE_WIKI_REFLIST = re.compile(r'\n(?:\*\s*)?(?:\[?\d+\]?\s*)?(?:\^.*)?(?:ISBN|ISSN|doi:|JSTOR|S2CID|OCLC).*', re.IGNORECASE)
 # Forum noise: lines that are pure metadata (likes, timestamps, user roles)
 RE_FORUM_NOISE = re.compile(
     r'^\s*(?:'
@@ -451,8 +456,38 @@ def is_blocked_content(content: str) -> bool:
 
 
 
+def _strip_wiki_tables(html: str) -> str:
+    """Remove Wikipedia infobox/navbox tables (may contain nested tables)."""
+    for css_class in ("infobox", "navbox"):
+        pattern = re.compile(
+            rf'<table\b[^>]*class="[^"]*{css_class}[^"]*"[^>]*>',
+            re.IGNORECASE,
+        )
+        while True:
+            m = pattern.search(html)
+            if not m:
+                break
+            # Find matching </table> accounting for nesting
+            depth = 1
+            pos = m.end()
+            while depth > 0 and pos < len(html):
+                next_open = html.find("<table", pos)
+                next_close = html.find("</table>", pos)
+                if next_close == -1:
+                    break
+                if next_open != -1 and next_open < next_close:
+                    depth += 1
+                    pos = next_open + 6
+                else:
+                    depth -= 1
+                    pos = next_close + 8
+            html = html[:m.start()] + html[pos:]
+    return html
+
 def _extract_with_trafilatura(html: str) -> str:
     """Extract article text using trafilatura (content-area detection + boilerplate removal)."""
+    # Strip Wikipedia infobox/navbox tables before extraction (they render as messy pipe-tables)
+    html = _strip_wiki_tables(html)
     import trafilatura
     text = trafilatura.extract(
         html,
@@ -503,6 +538,11 @@ def extract_text(html: str) -> str:
     text = text.strip()
     # Strip forum noise lines (likes, timestamps, user roles)
     text = RE_FORUM_NOISE.sub("", text)
+    # Clean Wikipedia artifacts: citation refs, internal links, reference lists
+    text = RE_WIKI_CITE.sub("", text)
+    text = RE_WIKI_CITE_NAMED.sub("", text)
+    text = RE_WIKI_LINK.sub(r"\1", text)
+    text = RE_WIKI_REFLIST.sub("", text)
     text = RE_MULTI_NEWLINE.sub("\n\n", text)
     # Prepend title if not already present
     if title and not text.startswith(f"# {title}"):
@@ -788,6 +828,26 @@ import atexit
 atexit.register(_shutdown_extract_pool)
 
 
+RE_WIKIPEDIA_URL = re.compile(r'https?://(\w+)\.wikipedia\.org/wiki/(.+?)(?:#.*)?$')
+
+def _fetch_wikipedia_api(lang: str, title: str, max_length: int) -> Optional[str]:
+    """Fetch clean text from Wikipedia API (no scraping needed)."""
+    import urllib.request
+    api_url = f"https://{lang}.wikipedia.org/w/api.php?action=query&titles={urllib.parse.quote(title)}&prop=extracts&explaintext=true&format=json"
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        pages = data.get("query", {}).get("pages", {})
+        for page_data in pages.values():
+            text = page_data.get("extract", "")
+            if text:
+                page_title = page_data.get("title", title)
+                return f"# {page_title}\n\n{text[:max_length]}"
+    except Exception:
+        pass
+    return None
+
 async def fetch_single_async(
     url: str,
     timeout: int,
@@ -799,6 +859,19 @@ async def fetch_single_async(
     """Fetch single URL using Scrapling's AsyncFetcher (TLS fingerprinting)."""
     t0 = time.monotonic()
     try:
+        # Wikipedia: use API for clean text instead of scraping
+        wiki_match = RE_WIKIPEDIA_URL.match(url)
+        if wiki_match:
+            lang, title = wiki_match.group(1), wiki_match.group(2)
+            content = await asyncio.get_event_loop().run_in_executor(
+                None, _fetch_wikipedia_api, lang, title, max_content_length
+            )
+            if content:
+                elapsed = time.monotonic() - t0
+                result = _create_fetch_result(url, content, min_content_length, max_content_length, query=query)
+                if progress:
+                    progress.url_result(url, result.success, elapsed, result.error or "")
+                return result
         page = await AsyncFetcher.get(url, timeout=timeout, stealthy_headers=True)
         elapsed = time.monotonic() - t0
 
