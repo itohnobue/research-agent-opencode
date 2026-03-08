@@ -976,28 +976,43 @@ def _fetch_twitter_api(screen_name: str, tweet_id: str, max_length: int) -> Opti
         pass
     return None
 
-def _fetch_reddit_via_redlib(reddit_path: str, max_length: int) -> Optional[str]:
-    """Fetch Reddit content via Redlib instances (clean HTML, no JS)."""
+def _fetch_reddit_json(reddit_path: str, max_length: int) -> Optional[str]:
+    """Fetch Reddit post + comments via Reddit's public JSON API (no auth)."""
     import urllib.request
-    instances = [
-        "safereddit.com",
-        "redlib.tux.pizza",
-        "rl.bloat.cat",
-    ]
-    for instance in instances:
-        url = f"https://{instance}{reddit_path}"
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "web-research-tool/1.0"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                html = resp.read().decode()
-            if not html or len(html) < 200:
-                continue
-            text = _extract_with_regex(html)
-            text = RE_MULTI_NEWLINE.sub("\n\n", text).strip()
-            if text and len(text) > 100:
-                return text[:max_length]
-        except Exception:
-            continue
+    # Reddit serves JSON when .json is appended to any URL
+    api_url = f"https://www.reddit.com{reddit_path}.json"
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0 (research)"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+        if not isinstance(data, list) or not data:
+            return None
+        post = data[0]["data"]["children"][0]["data"]
+        title = post.get("title", "")
+        selftext = post.get("selftext", "")
+        score = post.get("score", 0)
+        subreddit = post.get("subreddit", "")
+        author = post.get("author", "")
+        parts = [f"# {title}\n"]
+        parts.append(f"r/{subreddit} | u/{author} | {score} points\n")
+        if selftext:
+            parts.append(selftext)
+        # Extract top comments
+        if len(data) >= 2:
+            comments = data[1]["data"]["children"]
+            for c in comments[:5]:
+                if c.get("kind") != "t1":
+                    continue
+                cd = c["data"]
+                c_score = cd.get("score", 0)
+                c_author = cd.get("author", "")
+                c_body = cd.get("body", "")
+                if c_body:
+                    parts.append(f"\n---\n**u/{c_author}** ({c_score} points):\n{c_body}")
+        text = "\n".join(parts)
+        return text[:max_length] if text else None
+    except Exception:
+        pass
     return None
 
 def _fetch_wayback_fallback(url: str, max_length: int) -> Optional[str]:
@@ -1073,7 +1088,7 @@ async def fetch_single_async(
         if reddit_match:
             reddit_path = reddit_match.group(1)
             api_content = await loop.run_in_executor(
-                None, _fetch_reddit_via_redlib, reddit_path, max_content_length
+                None, _fetch_reddit_json, reddit_path, max_content_length
             )
         if api_content:
             elapsed = time.monotonic() - t0
