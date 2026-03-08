@@ -1029,11 +1029,15 @@ class MultiSearch:
 
         # Phase 1: DuckDuckGo (primary)
         ddg = DuckDuckGoSearch()
-        for url, title, snippet in ddg.search(query, num_results):
-            if url not in seen_urls:
-                seen_urls.add(url)
-                yield url, title, snippet
-                count += 1
+        try:
+            for url, title, snippet in ddg.search(query, num_results):
+                if url not in seen_urls:
+                    seen_urls.add(url)
+                    yield url, title, snippet
+                    count += 1
+        except Exception as e:
+            logger.debug(f"DDG search failed: {e}")
+            print(f"  DDG failed ({type(e).__name__}), trying Brave...", file=sys.stderr)
 
         # Phase 2: Brave (supplement if DDG fell short)
         shortfall = num_results - count
@@ -1131,19 +1135,24 @@ async def run_research_async(
 
             ddg_count = len(urls)
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            await loop.run_in_executor(executor, search_and_stream)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                await loop.run_in_executor(executor, search_and_stream)
 
-        search_elapsed = time.monotonic() - t0
-        source_info = f"{stats.urls_searched} URLs"
-        if searcher._brave_key:
-            source_info += " (DDG+Brave)"
-        else:
-            source_info += " (DDG)"
-        if skipped:
-            source_info += f", {skipped} filtered"
-        progress.message(f"  [search] {source_info} in {search_elapsed:.1f}s")
-        await fetch_queue.put(None)
+            search_elapsed = time.monotonic() - t0
+            source_info = f"{stats.urls_searched} URLs"
+            if searcher._brave_key:
+                source_info += " (DDG+Brave)"
+            else:
+                source_info += " (DDG)"
+            if skipped:
+                source_info += f", {skipped} filtered"
+            progress.message(f"  [search] {source_info} in {search_elapsed:.1f}s")
+        except Exception as e:
+            search_elapsed = time.monotonic() - t0
+            progress.message(f"  [search] failed after {search_elapsed:.1f}s: {e}")
+        finally:
+            await fetch_queue.put(None)
 
     async def fetch_consumer() -> None:
         semaphore = asyncio.Semaphore(config.max_concurrent)
