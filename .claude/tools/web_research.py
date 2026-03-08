@@ -832,6 +832,9 @@ atexit.register(_shutdown_extract_pool)
 RE_WIKIPEDIA_URL = re.compile(r'https?://(\w+)\.wikipedia\.org/wiki/(.+?)(?:#.*)?$')
 RE_GITHUB_REPO_URL = re.compile(r'https?://github\.com/([^/]+)/([^/]+?)(?:/?|/tree/[^/]+/?)?$')
 RE_ARXIV_URL = re.compile(r'https?://arxiv\.org/(?:abs|pdf)/(\d+\.\d+)')
+RE_YOUTUBE_URL = re.compile(r'https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)([A-Za-z0-9_-]{11})')
+RE_TWITTER_URL = re.compile(r'https?://(?:twitter\.com|x\.com)/([^/]+)/status/(\d+)')
+RE_REDDIT_URL = re.compile(r'https?://(?:www\.)?reddit\.com(/r/[^?#]+)')
 
 def _fetch_wikipedia_api(lang: str, title: str, max_length: int) -> Optional[str]:
     """Fetch clean text from Wikipedia API (no scraping needed)."""
@@ -908,6 +911,120 @@ def _fetch_arxiv_api(paper_id: str, max_length: int) -> Optional[str]:
         pass
     return None
 
+def _fetch_youtube_transcript(video_id: str, max_length: int) -> Optional[str]:
+    """Fetch YouTube video transcript via youtube-transcript-api."""
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+        from youtube_transcript_api.formatters import TextFormatter
+    except ImportError:
+        return None
+    try:
+        ytt = YouTubeTranscriptApi()
+        transcript = ytt.fetch(video_id)
+        text = TextFormatter().format_transcript(transcript)
+        if not text:
+            return None
+        # Try to get video title via yt-dlp if available
+        title = f"YouTube Video {video_id}"
+        try:
+            import subprocess
+            r = subprocess.run(
+                ["yt-dlp", "--print", "title", "--no-download", f"https://youtu.be/{video_id}"],
+                capture_output=True, text=True, timeout=5
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                title = r.stdout.strip()
+        except Exception:
+            pass
+        header = f"# {title}\n\n"
+        return (header + text)[:max_length]
+    except Exception:
+        pass
+    return None
+
+def _fetch_twitter_api(screen_name: str, tweet_id: str, max_length: int) -> Optional[str]:
+    """Fetch tweet text via FxTwitter API (no auth required)."""
+    import urllib.request
+    api_url = f"https://api.fxtwitter.com/status/{tweet_id}"
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        tweet = data.get("tweet", {})
+        author = tweet.get("author", {})
+        name = author.get("name", screen_name)
+        handle = author.get("screen_name", screen_name)
+        text = tweet.get("text", "")
+        created = tweet.get("created_at", "")
+        likes = tweet.get("likes", 0)
+        retweets = tweet.get("retweets", 0)
+        replies = tweet.get("replies", 0)
+        if not text:
+            return None
+        parts = [f"# @{handle} ({name})\n"]
+        if created:
+            parts.append(f"Date: {created}")
+        parts.append(f"Likes: {likes} | Retweets: {retweets} | Replies: {replies}\n")
+        parts.append(text)
+        quote = tweet.get("quote", {})
+        if quote and quote.get("text"):
+            q_handle = quote.get("author", {}).get("screen_name", "?")
+            parts.append(f"\n> Quoting @{q_handle}:\n> {quote['text']}")
+        result = "\n".join(parts)
+        return result[:max_length]
+    except Exception:
+        pass
+    return None
+
+def _fetch_reddit_via_redlib(reddit_path: str, max_length: int) -> Optional[str]:
+    """Fetch Reddit content via Redlib instances (clean HTML, no JS)."""
+    import urllib.request
+    instances = [
+        "safereddit.com",
+        "redlib.tux.pizza",
+        "rl.bloat.cat",
+    ]
+    for instance in instances:
+        url = f"https://{instance}{reddit_path}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "web-research-tool/1.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                html = resp.read().decode()
+            if not html or len(html) < 200:
+                continue
+            text = _extract_with_regex(html)
+            text = RE_MULTI_NEWLINE.sub("\n\n", text).strip()
+            if text and len(text) > 100:
+                return text[:max_length]
+        except Exception:
+            continue
+    return None
+
+def _fetch_wayback_fallback(url: str, max_length: int) -> Optional[str]:
+    """Try Wayback Machine for a recent cached version of the page."""
+    import urllib.request
+    api_url = f"https://archive.org/wayback/available?url={urllib.parse.quote(url, safe='')}"
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        snapshot = data.get("archived_snapshots", {}).get("closest", {})
+        if not snapshot.get("available"):
+            return None
+        archive_url = snapshot.get("url", "")
+        if not archive_url:
+            return None
+        req = urllib.request.Request(archive_url, headers={"User-Agent": "web-research-tool/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode()
+        text = _extract_with_regex(html)
+        text = RE_MULTI_NEWLINE.sub("\n\n", text).strip()
+        if text and len(text) > 200:
+            return text[:max_length]
+    except Exception:
+        pass
+    return None
+
 async def fetch_single_async(
     url: str,
     timeout: int,
@@ -939,6 +1056,24 @@ async def fetch_single_async(
             paper_id = arxiv_match.group(1)
             api_content = await loop.run_in_executor(
                 None, _fetch_arxiv_api, paper_id, max_content_length
+            )
+        yt_match = RE_YOUTUBE_URL.search(url) if not api_content else None
+        if yt_match:
+            video_id = yt_match.group(1)
+            api_content = await loop.run_in_executor(
+                None, _fetch_youtube_transcript, video_id, max_content_length
+            )
+        tw_match = RE_TWITTER_URL.match(url) if not api_content else None
+        if tw_match:
+            screen_name, tweet_id = tw_match.group(1), tw_match.group(2)
+            api_content = await loop.run_in_executor(
+                None, _fetch_twitter_api, screen_name, tweet_id, max_content_length
+            )
+        reddit_match = RE_REDDIT_URL.match(url) if not api_content else None
+        if reddit_match:
+            reddit_path = reddit_match.group(1)
+            api_content = await loop.run_in_executor(
+                None, _fetch_reddit_via_redlib, reddit_path, max_content_length
             )
         if api_content:
             elapsed = time.monotonic() - t0
@@ -997,6 +1132,13 @@ async def fetch_single_async(
             content = structured + content
 
         result = _create_fetch_result(url, content, min_content_length, max_content_length, query=query)
+        # Wayback Machine fallback for failed/paywalled content
+        if not result.success:
+            wb_content = await loop.run_in_executor(
+                None, _fetch_wayback_fallback, url, max_content_length
+            )
+            if wb_content:
+                result = _create_fetch_result(url, wb_content, min_content_length, max_content_length, query=query)
         if progress:
             progress.url_result(url, result.success, elapsed, result.error or "")
         return result
