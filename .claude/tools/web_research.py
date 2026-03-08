@@ -830,8 +830,6 @@ atexit.register(_shutdown_extract_pool)
 
 RE_WIKIPEDIA_URL = re.compile(r'https?://(\w+)\.wikipedia\.org/wiki/(.+?)(?:#.*)?$')
 RE_GITHUB_REPO_URL = re.compile(r'https?://github\.com/([^/]+)/([^/]+?)(?:/?|/tree/[^/]+/?)?$')
-RE_STACKEXCHANGE_URL = re.compile(r'https?://([^/]+\.(?:stackexchange|stackoverflow|serverfault|superuser|askubuntu)\.com)/questions/(\d+)')
-RE_DEVTO_URL = re.compile(r'https?://dev\.to/[^/]+/[^/]+$')
 RE_ARXIV_URL = re.compile(r'https?://arxiv\.org/(?:abs|pdf)/(\d+\.\d+)')
 
 def _fetch_wikipedia_api(lang: str, title: str, max_length: int) -> Optional[str]:
@@ -870,83 +868,6 @@ def _fetch_github_readme(owner: str, repo: str, max_length: int) -> Optional[str
         text = RE_MULTI_NEWLINE.sub("\n\n", text).strip()
         if text:
             return f"# {owner}/{repo}\n\n{text[:max_length]}"
-    except Exception:
-        pass
-    return None
-
-def _fetch_stackexchange_api(site_domain: str, question_id: str, max_length: int) -> Optional[str]:
-    """Fetch question + top answers from Stack Exchange API (clean markdown)."""
-    import urllib.request
-    import gzip
-    # Map domain to SE API site name
-    site_map = {"stackoverflow.com": "stackoverflow", "serverfault.com": "serverfault",
-                "superuser.com": "superuser", "askubuntu.com": "askubuntu"}
-    site = site_map.get(site_domain) or site_domain.split(".")[0]  # quant.stackexchange.com -> quant
-    api_url = f"https://api.stackexchange.com/2.3/questions/{question_id}?order=desc&sort=activity&site={site}&filter=withbody"
-    try:
-        req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            raw = resp.read()
-            # SE API always gzips responses
-            try:
-                raw = gzip.decompress(raw)
-            except Exception:
-                pass
-            data = json.loads(raw.decode())
-        items = data.get("items", [])
-        if not items:
-            return None
-        q = items[0]
-        title = q.get("title", "")
-        q_body = q.get("body", "")
-        # Strip HTML tags from body and unescape entities (SE API returns HTML)
-        q_body = unescape(re.sub(r'<[^>]+>', '', q_body)).strip()
-
-        parts = [f"# {title}\n\n{q_body}"]
-
-        # Fetch top answers
-        ans_url = f"https://api.stackexchange.com/2.3/questions/{question_id}/answers?order=desc&sort=votes&site={site}&filter=withbody&pagesize=3"
-        req = urllib.request.Request(ans_url, headers={"User-Agent": "web-research-tool/1.0"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            raw = resp.read()
-            try:
-                raw = gzip.decompress(raw)
-            except Exception:
-                pass
-            ans_data = json.loads(raw.decode())
-        for i, ans in enumerate(ans_data.get("items", [])[:3], 1):
-            score = ans.get("score", 0)
-            body = unescape(re.sub(r'<[^>]+>', '', ans.get("body", ""))).strip()
-            accepted = " ✓" if ans.get("is_accepted") else ""
-            parts.append(f"\n## Answer {i} (score: {score}{accepted})\n\n{body}")
-
-        text = "\n".join(parts)
-        return text[:max_length] if text else None
-    except Exception:
-        pass
-    return None
-
-def _fetch_devto_api(url: str, max_length: int) -> Optional[str]:
-    """Fetch Dev.to article via Forem API (clean markdown body)."""
-    import urllib.request
-    # Dev.to API can look up by URL path
-    api_url = f"https://dev.to/api/articles/{url.split('dev.to/')[-1]}"
-    try:
-        req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
-        title = data.get("title", "")
-        body = data.get("body_markdown", "") or data.get("body_html", "")
-        if body and "<" in body[:100]:
-            # Got HTML, strip tags
-            body = unescape(re.sub(r'<[^>]+>', '', body)).strip()
-        tag_list = data.get("tag_list", [])
-        tags = tag_list if isinstance(tag_list, str) else ", ".join(tag_list)
-        header = f"# {title}\n"
-        if tags:
-            header += f"Tags: {tags}\n"
-        header += "\n"
-        return (header + body)[:max_length] if body else None
     except Exception:
         pass
     return None
@@ -1011,17 +932,6 @@ async def fetch_single_async(
             owner, repo = gh_match.group(1), gh_match.group(2)
             api_content = await loop.run_in_executor(
                 None, _fetch_github_readme, owner, repo, max_content_length
-            )
-        se_match = RE_STACKEXCHANGE_URL.match(url) if not api_content else None
-        if se_match:
-            site_domain, question_id = se_match.group(1), se_match.group(2)
-            api_content = await loop.run_in_executor(
-                None, _fetch_stackexchange_api, site_domain, question_id, max_content_length
-            )
-        devto_match = RE_DEVTO_URL.match(url) if not api_content else None
-        if devto_match:
-            api_content = await loop.run_in_executor(
-                None, _fetch_devto_api, url, max_content_length
             )
         arxiv_match = RE_ARXIV_URL.match(url) if not api_content else None
         if arxiv_match:
