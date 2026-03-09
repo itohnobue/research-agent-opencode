@@ -11,8 +11,7 @@ Unified tool combining search and fetch into a single optimized workflow:
 1. Search via DuckDuckGo + Brave (fallback) for maximum coverage
 2. Filter and deduplicate URLs during search (early filtering)
 3. Fetch content in parallel via Scrapling (TLS fingerprinting, anti-bot bypass)
-4. Stealth browser retry for blocked pages (403/CAPTCHA)
-5. Scrapling text extraction fallback for "Too short" pages
+4. Scrapling text extraction fallback for "Too short" pages
 6. Output combined results (streaming or batched)
 
 Usage:
@@ -167,19 +166,12 @@ PDFTOTEXT_PATH = shutil.which("pdftotext")
 # =============================================================================
 
 from scrapling.fetchers import AsyncFetcher
-try:
-    from scrapling.fetchers import StealthyFetcher
-except Exception:
-    StealthyFetcher = None
 from ddgs import DDGS
 
 # Scrapling adds its own StreamHandler at INFO — remove it post-import
 _scrapling_logger = logging.getLogger("scrapling")
 _scrapling_logger.handlers.clear()
 _scrapling_logger.setLevel(logging.CRITICAL)
-
-# Errors that warrant a stealth retry (browser-based fetch)
-STEALTH_RETRY_ERRORS = {"HTTP 403", "HTTP 429", "CAPTCHA/blocked"}
 
 # =============================================================================
 # DATA CLASSES
@@ -197,7 +189,6 @@ class ResearchConfig:
     max_concurrent: int = 50  # Match default search count
     search_results: int = 50
     stream: bool = False
-    no_stealth: bool = True
 
 
 @dataclass
@@ -224,11 +215,10 @@ class ResearchStats:
 def _quality_fields(results: Optional[List[FetchResult]]) -> dict:
     """Extract quality-related fields from fetch results."""
     if not results:
-        return {"short_pages": 0, "domains": [], "stealth_retries": 0}
+        return {"short_pages": 0, "domains": []}
     return {
         "short_pages": sum(1 for r in results if r.success and len(r.content) < 200),
         "domains": list({urllib.parse.urlparse(r.url).netloc for r in results if r.success}),
-        "stealth_retries": sum(1 for r in results if r.source == "stealth"),
     }
 
 
@@ -298,8 +288,6 @@ def print_usage_stats(quality: bool = False) -> None:
     avg_chars = sum(e.get("content_chars", 0) for e in events) / total
     total_short = sum(e.get("short_pages", 0) for e in events)
     total_fetched = sum(e.get("urls_fetched", 0) for e in events)
-    total_stealth = sum(e.get("stealth_retries", 0) for e in events)
-
     print(f"Web Research Usage (last 30 days)")
     print(f"{'='*40}")
     print(f"Total searches:    {total}")
@@ -320,9 +308,6 @@ def print_usage_stats(quality: bool = False) -> None:
         print(f"Output quality:")
         print(f"  Short pages (<200 chars): {total_short}/{total_fetched}" +
               (f" ({100*total_short/total_fetched:.0f}%)" if total_fetched else ""))
-        print(f"  Stealth retries:          {total_stealth}")
-        if total_stealth and total_fetched:
-            print(f"  Stealth retry rate:       {100*total_stealth/total_fetched:.0f}%")
         print()
         print(f"Top domains (by fetch count):")
         for domain, count in domain_ok.most_common(10):
@@ -1161,64 +1146,6 @@ async def fetch_single_async(
 
 
 # =============================================================================
-# STEALTH FETCHER (browser-based retry for blocked pages)
-# =============================================================================
-
-MAX_STEALTH_RETRIES = 5  # Cap to avoid slowing down the whole search
-
-async def fetch_stealth_async(
-    url: str,
-    min_content_length: int,
-    max_content_length: int,
-    progress: Optional[ProgressReporter] = None,
-    query: str = "",
-) -> FetchResult:
-    """Fetch a single URL using StealthyFetcher (headless browser with anti-bot bypass)."""
-    t0 = time.monotonic()
-    try:
-        page = await asyncio.wait_for(
-            StealthyFetcher.async_fetch(url, headless=True, network_idle=True),
-            timeout=15
-        )
-        elapsed = time.monotonic() - t0
-
-        if page.status != 200:
-            if progress:
-                progress.url_result(url, False, elapsed, f"Stealth HTTP {page.status}")
-            return FetchResult(url=url, success=False, error=f"Stealth HTTP {page.status}", source="stealth")
-
-        raw_html = page.html_content
-        if is_blocked_content(raw_html):
-            if progress:
-                progress.url_result(url, False, elapsed, "Stealth still blocked")
-            return FetchResult(url=url, success=False, error="Stealth still blocked", source="stealth")
-
-        loop = asyncio.get_event_loop()
-        content, structured = await loop.run_in_executor(
-            _get_extract_pool(), _extract_content, raw_html
-        )
-        if len(content) < min_content_length:
-            scrapling_content = _extract_with_scrapling_fallback(page, min_content_length)
-            if scrapling_content:
-                content = scrapling_content
-        if structured:
-            content = structured + content
-
-        result = _create_fetch_result(url, content, min_content_length, max_content_length, query=query)
-        result.source = "stealth"
-        if progress:
-            progress.url_result(url, result.success, elapsed, result.error or "")
-        return result
-
-    except Exception as e:
-        elapsed = time.monotonic() - t0
-        error_msg = str(e)[:50] if str(e) else type(e).__name__
-        if progress:
-            progress.url_result(url, False, elapsed, f"Stealth: {error_msg}")
-        return FetchResult(url=url, success=False, error=f"Stealth: {error_msg}", source="stealth")
-
-
-# =============================================================================
 # SEARCH BACKENDS
 # =============================================================================
 
@@ -1561,7 +1488,6 @@ async def run_research_async(
     asyncio.create_task(fetch_consumer())
 
     fetched = 0
-    stealth_candidates: List[FetchResult] = []
     while True:
         result = await result_queue.get()
         if result is None:
@@ -1570,37 +1496,11 @@ async def run_research_async(
         if result.success:
             stats.urls_fetched += 1
             stats.content_chars += len(result.content)
-        elif result.error in STEALTH_RETRY_ERRORS:
-            stealth_candidates.append(result)
         progress.update("fetch", fetched, stats.urls_searched or fetched)
         yield result
 
     progress.newline()
     progress.summary(stats.urls_fetched, stats.urls_searched, stats.content_chars)
-
-    # Phase 2: Stealth retry for blocked/403/CAPTCHA pages (parallel)
-    if stealth_candidates and not config.no_stealth:
-        retry_urls = [r.url for r in stealth_candidates[:MAX_STEALTH_RETRIES]]
-        progress.message(f"  [stealth] retrying {len(retry_urls)} blocked URLs...")
-        progress._ok_count = 0
-        progress._failures = []
-        progress.phase_start("stealth")
-
-        stealth_results = await asyncio.gather(*(
-            fetch_stealth_async(url, config.min_content_length, config.max_content_length, progress=progress, query=config.query)
-            for url in retry_urls
-        ))
-
-        stealth_ok = 0
-        for result in stealth_results:
-            if result.success:
-                stealth_ok += 1
-                stats.urls_fetched += 1
-                stats.content_chars += len(result.content)
-            yield result
-
-        progress.newline()
-        progress.message(f"  [stealth] {stealth_ok}/{len(retry_urls)} recovered")
 
 
 # =============================================================================
@@ -1715,58 +1615,6 @@ def _dedup_results(
         )
 
     return deduped, stats
-
-
-def _gemini_summarize(text: str, query: str, progress: Optional['ProgressReporter'] = None) -> str:
-    """Summarize search results via Gemini Flash API. Returns summary or original text on failure."""
-    import urllib.request
-
-    api_key = os.environ.get("GEMINI_API_KEY", "")
-    if not api_key:
-        # Try reading from config file
-        key_path = Path.home() / ".config" / "gemini" / "api_key"
-        if key_path.exists():
-            api_key = key_path.read_text().strip()
-    if not api_key:
-        if progress:
-            progress.message("  [summarize] no GEMINI_API_KEY, skipping")
-        return text
-
-    prompt = (
-        "Summarize these web search results for the query: " + json.dumps(query) + "\n"
-        "Keep ALL specific technical details, version numbers, feature names, "
-        "benchmarks, code examples, and URLs of sources. "
-        "Remove fluff, intros, outros, repetition across pages, and promotional content. "
-        "Output a dense, factual summary.\n\n" + text
-    )
-
-    payload = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"maxOutputTokens": 8192, "temperature": 0.1},
-    }).encode()
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-
-    t0 = time.monotonic()
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read())
-        summary = data["candidates"][0]["content"]["parts"][0]["text"]
-        # Strip Gemini's occasional massive whitespace padding in tables
-        summary = re.sub(r' {10,}', ' ', summary)
-        elapsed = time.monotonic() - t0
-        if progress:
-            progress.message(
-                f"  [summarize] {len(text):,} → {len(summary):,} chars "
-                f"({len(text)/len(summary):.1f}x) in {elapsed:.1f}s"
-            )
-        return summary
-    except Exception as e:
-        elapsed = time.monotonic() - t0
-        if progress:
-            progress.message(f"  [summarize] failed after {elapsed:.1f}s: {e}")
-        return text
 
 
 def _global_compress(
@@ -1967,7 +1815,7 @@ Examples:
   python web_research.py -u url1 url2 url3           # Fetch multiple URLs in parallel
 
 Search: DDG primary + Brave fallback (set BRAVE_API_KEY env var or ~/.config/brave/api_key)
-Fetch: Scrapling AsyncFetcher (TLS fingerprinting) + StealthyFetcher retry
+Fetch: Scrapling AsyncFetcher (TLS fingerprinting)
 Extract: w3m > regex > Scrapling DOM parser (tiered fallback)
 Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin, medium
         """
@@ -1997,14 +1845,6 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Stream output as results arrive (reduces memory usage)")
     parser.add_argument("-g", "--global-budget", type=int, default=0,
                         help="Global char budget across all pages (0 = unlimited)")
-    parser.add_argument("--stealth", action="store_true",
-                        help="Enable stealth browser retry for blocked pages (requires Playwright)")
-    parser.add_argument("--no-stealth", action="store_true", default=True,
-                        help="Disable stealth browser retry (default)")
-    parser.add_argument("-S", "--summarize", action="store_true", default=True,
-                        help="Summarize results via Gemini Flash (default: on, reduces output ~10x)")
-    parser.add_argument("--no-summarize", action="store_true",
-                        help="Disable Gemini summarization, output raw text")
     parser.add_argument("--usage", action="store_true",
                         help="Show usage statistics (last 30 days)")
     parser.add_argument("--quality", action="store_true",
@@ -2015,19 +1855,6 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
     if args.usage or args.quality:
         print_usage_stats(quality=args.quality)
         sys.exit(0)
-
-    # --no-summarize overrides -S default
-    if args.no_summarize:
-        args.summarize = False
-
-    # Disable summarization if no Gemini API key is available
-    if args.summarize:
-        _has_key = bool(os.environ.get("GEMINI_API_KEY", ""))
-        if not _has_key:
-            _key_path = Path.home() / ".config" / "gemini" / "api_key"
-            _has_key = _key_path.exists() and _key_path.read_text().strip() != ""
-        if not _has_key:
-            args.summarize = False
 
     # JSON output must not have progress messages mixed in (agents parse stdout)
     if args.output == "json":
@@ -2042,16 +1869,11 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
         url_max = args.max_length if "--max-length" in sys.argv or "-m" in sys.argv else 50000
         async def fetch_urls():
             progress = ProgressReporter(quiet=args.quiet, verbose=args.verbose)
-            results = []
             tasks = [
                 fetch_single_async(url, args.timeout, 100, url_max, progress=progress)
                 for url in args.url
             ]
-            for result in await asyncio.gather(*tasks):
-                if not result.success and result.error in STEALTH_RETRY_ERRORS and args.stealth:
-                    result = await fetch_stealth_async(result.url, 100, url_max, progress=progress)
-                results.append(result)
-            return results
+            return list(await asyncio.gather(*tasks))
 
         t0 = time.monotonic()
         try:
@@ -2094,7 +1916,6 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
             max_concurrent=args.concurrent,
             search_results=args.search,
             stream=args.stream,
-            no_stealth=not args.stealth,
         )
 
     # Hard wall-clock timeout: kill the entire process after 5 minutes
@@ -2107,7 +1928,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                 "urls_searched": 0, "urls_fetched": 0, "content_chars": 0,
                 "ok": False, "error": "wall-clock timeout",
                 "ms": int((time.monotonic() - _wall_t0) * 1000), "timeout": True,
-                "short_pages": 0, "domains": [], "stealth_retries": 0,
+                "short_pages": 0, "domains": [],
             })
         print(f"\nwall-clock timeout ({_WALL_TIMEOUT}s) — exiting", file=sys.stderr)
         os._exit(1)  # kills child processes (ProcessPoolExecutor workers)
@@ -2128,7 +1949,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                     "urls_fetched": 0, "content_chars": 0,
                     "ok": True, "error": None,
                     "ms": int((time.monotonic() - t0) * 1000), "timeout": False,
-                    "short_pages": 0, "domains": [], "stealth_retries": 0,
+                    "short_pages": 0, "domains": [],
                 })
             else:
                 results = run_research(config, verbose=args.verbose)
@@ -2150,11 +1971,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                     elif args.output == "markdown":
                         print(format_batch_markdown(results, config.query, config.max_content_length))
                     else:
-                        raw = format_batch_raw(results)
-                        if args.summarize:
-                            progress = ProgressReporter(quiet=args.quiet, verbose=args.verbose)
-                            raw = _gemini_summarize(raw, config.query, progress)
-                        print(raw)
+                        print(format_batch_raw(results))
                 else:
                     print("No results found", file=sys.stderr)
                     sys.exit(1)
@@ -2222,11 +2039,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         print(f"\n{'='*60}")
                         print(f"QUERY: {query}")
                         print(f"{'='*60}\n")
-                    raw = format_batch_raw(results)
-                    if args.summarize:
-                        progress = ProgressReporter(quiet=args.quiet, verbose=args.verbose)
-                        raw = _gemini_summarize(raw, query, progress)
-                    print(raw)
+                    print(format_batch_raw(results))
 
     except KeyboardInterrupt:
         print("\nInterrupted", file=sys.stderr)
