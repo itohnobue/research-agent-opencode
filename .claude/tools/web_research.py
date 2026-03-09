@@ -1214,12 +1214,29 @@ def _load_brave_api_key() -> Optional[str]:
         return None
 
 
+_STOPWORDS = frozenset(
+    "a an the and or but in on at to for of is it by with from as be was were "
+    "are been has have had do does did will would can could should may might "
+    "this that these those how what when where which who whom why not no nor "
+    "so if then than too very just about also into over after before between "
+    "new best top most latest current using used use get like".split()
+)
+
 def _snippet_relevance(query: str, title: str, snippet: str) -> float:
-    """Score snippet relevance to query by word overlap. Returns 0.0-1.0."""
-    query_words = set(query.lower().split())
-    text_words = set((title + " " + snippet).lower().split())
+    """Score snippet relevance to query by content word overlap. Returns 0.0-1.0.
+
+    Filters out stopwords and short/numeric tokens so common words like
+    'AI', '2025', 'new', 'best' don't inflate relevance scores.
+    """
+    raw_words = set(query.lower().split())
+    # Keep only content words: not a stopword, not purely numeric, length > 2
+    query_words = {w for w in raw_words if w not in _STOPWORDS and not w.isdigit() and len(w) > 2}
+    if not query_words:
+        # All query words are stopwords/short — fall back to raw overlap
+        query_words = raw_words
     if not query_words:
         return 1.0
+    text_words = set((title + " " + snippet).lower().split())
     return len(query_words & text_words) / len(query_words)
 
 
@@ -1399,12 +1416,18 @@ async def run_research_async(
                 seen_in_search.add(url)
                 urls.append(url)
                 stats.urls_searched = len(urls)
-                # Snippet relevance gate: skip URLs with zero query word overlap
+                # Snippet relevance gate: require meaningful query word overlap
+                # For long queries (4+ words), require at least 2 matching words
+                # to filter junk that only matches common words like "AI" or "2025"
                 # Always enqueue at least 5 URLs (safety net for edge cases)
-                relevance = _snippet_relevance(config.query, title, snippet)
-                if relevance == 0 and enqueued >= 5:
-                    skipped += 1
-                    continue
+                if enqueued >= 5:
+                    query_words = set(config.query.lower().split())
+                    text_words = set((title + " " + snippet).lower().split())
+                    overlap = len(query_words & text_words)
+                    min_overlap = 2 if len(query_words) >= 4 else 1
+                    if overlap < min_overlap:
+                        skipped += 1
+                        continue
                 loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
                 enqueued += 1
 
@@ -1423,13 +1446,20 @@ async def run_research_async(
                 loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
                 enqueued += 1
 
+            # Relevance gate for bonus results — require 2+ query word overlap
+            # to prevent "AI" or "2025" alone from pulling in random Reddit/news
+            def _bonus_relevant(title: str, body: str = "") -> bool:
+                query_words = set(config.query.lower().split())
+                text_words = set((title + " " + body).lower().split())
+                return len(query_words & text_words) >= min(2, len(query_words))
+
             # Run bonus searches in parallel (news + reddit)
             def _bonus_news():
                 try:
                     ddg = DDGS(verify=False)
                     for r in ddg.news(config.query, max_results=5):
                         url = r.get("url", "")
-                        if url:
+                        if url and _bonus_relevant(r.get("title", ""), r.get("body", "")):
                             _enqueue_bonus(url)
                 except Exception:
                     pass
@@ -1443,8 +1473,10 @@ async def run_research_async(
                     with urllib.request.urlopen(req, timeout=5) as resp:
                         data = json.loads(resp.read().decode())
                     for child in data.get("data", {}).get("children", []):
-                        permalink = child.get("data", {}).get("permalink", "")
-                        if permalink:
+                        d = child.get("data", {})
+                        permalink = d.get("permalink", "")
+                        title = d.get("title", "")
+                        if permalink and _bonus_relevant(title, d.get("selftext", "")[:200]):
                             _enqueue_bonus(f"https://www.reddit.com{permalink}")
                 except Exception:
                     pass
@@ -1676,9 +1708,12 @@ def _gemini_summarize(text: str, query: str, progress: Optional['ProgressReporte
 
     prompt = (
         "Summarize these web search results for the query: " + json.dumps(query) + "\n"
+        "IMPORTANT: Completely omit any results that are not relevant to the query. "
+        "Do not include tangentially related content just because it shares a keyword. "
         "Keep ALL specific technical details, version numbers, feature names, "
-        "benchmarks, code examples, and URLs of sources. "
+        "benchmarks, code examples, and URLs of sources that are relevant to the query. "
         "Remove fluff, intros, outros, repetition across pages, and promotional content. "
+        "Use bullet points, not markdown tables. "
         "Output a dense, factual summary.\n\n" + text
     )
 
@@ -1695,8 +1730,9 @@ def _gemini_summarize(text: str, query: str, progress: Optional['ProgressReporte
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read())
         summary = data["candidates"][0]["content"]["parts"][0]["text"]
-        # Strip Gemini's occasional massive whitespace padding in tables
+        # Strip Gemini's occasional massive whitespace/dash padding in tables
         summary = re.sub(r' {10,}', ' ', summary)
+        summary = re.sub(r'-{20,}', '---', summary)
         elapsed = time.monotonic() - t0
         if progress:
             progress.message(
