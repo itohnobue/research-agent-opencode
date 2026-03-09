@@ -35,6 +35,8 @@ You are a web research specialist.
 | `-q, --quiet` | Suppress progress | false |
 | `-v, --verbose` | Show per-URL timing and status | false |
 | `--stream` | Stream output (reduces memory) | false |
+| `--sci` | Scientific mode: add arXiv + OpenAlex bonus sources | false |
+| `--med` | Medical mode: add PubMed + Europe PMC + OpenAlex bonus sources | false |
 
 ## Output Example
 
