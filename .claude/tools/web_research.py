@@ -845,7 +845,7 @@ def _fetch_wikipedia_api(lang: str, title: str, max_length: int) -> Optional[str
     try:
         req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
         pages = data.get("query", {}).get("pages", {})
         for page_data in pages.values():
             text = page_data.get("extract", "")
@@ -866,7 +866,7 @@ def _fetch_github_readme(owner: str, repo: str, max_length: int) -> Optional[str
             "User-Agent": "web-research-tool/1.0",
         })
         with urllib.request.urlopen(req, timeout=5) as resp:
-            html = resp.read().decode()
+            html = resp.read().decode("utf-8", errors="replace")
         if not html:
             return None
         # Use our existing text extraction on the rendered HTML
@@ -886,7 +886,7 @@ def _fetch_arxiv_api(paper_id: str, max_length: int) -> Optional[str]:
     try:
         req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
-            xml_data = resp.read().decode()
+            xml_data = resp.read().decode("utf-8", errors="replace")
         root = ET.fromstring(xml_data)
         ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
         entry = root.find("atom:entry", ns)
@@ -920,7 +920,7 @@ def _fetch_twitter_api(screen_name: str, tweet_id: str, max_length: int) -> Opti
     try:
         req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
         tweet = data.get("tweet", {})
         author = tweet.get("author", {})
         name = author.get("name", screen_name)
@@ -955,7 +955,7 @@ def _fetch_reddit_json(reddit_path: str, max_length: int) -> Optional[str]:
     try:
         req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0 (research)"})
         with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read().decode())
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
         if not isinstance(data, list) or not data:
             return None
         post = data[0]["data"]["children"][0]["data"]
@@ -993,7 +993,7 @@ def _fetch_wayback_fallback(url: str, max_length: int) -> Optional[str]:
     try:
         req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
         snapshot = data.get("archived_snapshots", {}).get("closest", {})
         if not snapshot.get("available"):
             return None
@@ -1002,7 +1002,7 @@ def _fetch_wayback_fallback(url: str, max_length: int) -> Optional[str]:
             return None
         req = urllib.request.Request(archive_url, headers={"User-Agent": "web-research-tool/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode()
+            html = resp.read().decode("utf-8", errors="replace")
         text = _extract_with_regex(html)
         text = RE_MULTI_NEWLINE.sub("\n\n", text).strip()
         if text and len(text) > 200:
@@ -1077,7 +1077,22 @@ async def fetch_single_async(
                 progress.url_result(url, False, elapsed, f"HTTP {page.status}")
             return FetchResult(url=url, success=False, error=f"HTTP {page.status}")
 
-        raw_html = page.html_content
+        try:
+            raw_html = page.html_content
+        except (UnicodeDecodeError, AttributeError):
+            # Scrapling failed to decode — try common encodings on raw bytes
+            raw_bytes = page.body if hasattr(page, 'body') else b""
+            raw_html = ""
+            for enc in ("utf-8", "latin-1", "windows-1252", "iso-8859-1"):
+                try:
+                    raw_html = raw_bytes.decode(enc, errors="replace")
+                    break
+                except Exception:
+                    continue
+            if not raw_html:
+                if progress:
+                    progress.url_result(url, False, elapsed, "Encoding error")
+                return FetchResult(url=url, success=False, error="Encoding error")
         if len(raw_html) > MAX_CONTENT_BYTES:
             # Truncate HTML but still try to extract text
             raw_html = raw_html[:MAX_CONTENT_BYTES]
@@ -1252,7 +1267,7 @@ class BraveSearch:
         count = 0
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
             for r in data.get("web", {}).get("results", []):
                 result_url = r.get("url", "")
                 if result_url and result_url not in seen_urls and is_valid_url(result_url) and not is_blocked_url(result_url):
@@ -1445,7 +1460,7 @@ async def run_research_async(
                     api_url = f"https://www.reddit.com/search.json?q={reddit_q}&sort=relevance&limit=5"
                     req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0 (research)"})
                     with urllib.request.urlopen(req, timeout=5) as resp:
-                        data = json.loads(resp.read().decode())
+                        data = json.loads(resp.read().decode("utf-8", errors="replace"))
                     for child in data.get("data", {}).get("children", []):
                         permalink = child.get("data", {}).get("permalink", "")
                         if permalink:
