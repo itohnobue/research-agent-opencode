@@ -166,7 +166,11 @@ PDFTOTEXT_PATH = shutil.which("pdftotext")
 # REQUIRED DEPENDENCIES (managed by uv)
 # =============================================================================
 
-from scrapling.fetchers import AsyncFetcher, StealthyFetcher
+from scrapling.fetchers import AsyncFetcher
+try:
+    from scrapling.fetchers import StealthyFetcher
+except Exception:
+    StealthyFetcher = None
 from ddgs import DDGS
 
 # Scrapling adds its own StreamHandler at INFO — remove it post-import
@@ -193,7 +197,7 @@ class ResearchConfig:
     max_concurrent: int = 50  # Match default search count
     search_results: int = 50
     stream: bool = False
-    no_stealth: bool = False
+    no_stealth: bool = True
 
 
 @dataclass
@@ -1939,8 +1943,10 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                         help="Stream output as results arrive (reduces memory usage)")
     parser.add_argument("-g", "--global-budget", type=int, default=0,
                         help="Global char budget across all pages (0 = unlimited)")
-    parser.add_argument("--no-stealth", action="store_true",
-                        help="Disable stealth browser retry for blocked pages")
+    parser.add_argument("--stealth", action="store_true",
+                        help="Enable stealth browser retry for blocked pages (requires Playwright)")
+    parser.add_argument("--no-stealth", action="store_true", default=True,
+                        help="Disable stealth browser retry (default)")
     parser.add_argument("-S", "--summarize", action="store_true", default=True,
                         help="Summarize results via Gemini Flash (default: on, reduces output ~10x)")
     parser.add_argument("--no-summarize", action="store_true",
@@ -1959,6 +1965,15 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
     # --no-summarize overrides -S default
     if args.no_summarize:
         args.summarize = False
+
+    # Disable summarization if no Gemini API key is available
+    if args.summarize:
+        _has_key = bool(os.environ.get("GEMINI_API_KEY", ""))
+        if not _has_key:
+            _key_path = Path.home() / ".config" / "gemini" / "api_key"
+            _has_key = _key_path.exists() and _key_path.read_text().strip() != ""
+        if not _has_key:
+            args.summarize = False
 
     # JSON output must not have progress messages mixed in (agents parse stdout)
     if args.output == "json":
@@ -1979,7 +1994,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
                 for url in args.url
             ]
             for result in await asyncio.gather(*tasks):
-                if not result.success and result.error in STEALTH_RETRY_ERRORS and not args.no_stealth:
+                if not result.success and result.error in STEALTH_RETRY_ERRORS and args.stealth:
                     result = await fetch_stealth_async(result.url, 100, url_max, progress=progress)
                 results.append(result)
             return results
@@ -2025,7 +2040,7 @@ Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin
             max_concurrent=args.concurrent,
             search_results=args.search,
             stream=args.stream,
-            no_stealth=args.no_stealth,
+            no_stealth=not args.stealth,
         )
 
     # Hard wall-clock timeout: kill the entire process after 5 minutes
