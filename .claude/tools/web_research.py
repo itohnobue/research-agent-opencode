@@ -12,7 +12,7 @@ Unified tool combining search and fetch into a single optimized workflow:
 2. Filter and deduplicate URLs during search (early filtering)
 3. Fetch content in parallel via Scrapling (TLS fingerprinting, anti-bot bypass)
 4. Scrapling text extraction fallback for "Too short" pages
-6. Output combined results (streaming or batched)
+5. Output combined results (streaming or batched)
 
 Usage:
     python web_research.py "search query"
@@ -83,7 +83,7 @@ SKIP_URL_PATTERNS: Tuple[str, ...] = (
     r"/login", r"/signin", r"/signup", r"/cart", r"/checkout",
     r"/tag/", r"/tags/", r"/category/", r"/categories/",
     r"/archive/", r"/page/\d+",
-    # .pdf: now handled via pandoc extraction
+    # .pdf: now handled via pdftotext extraction
 )
 
 
@@ -117,7 +117,10 @@ _BLOCKED_URL_PATTERN = re.compile(
 )
 
 # HTML extraction - simple fast patterns (optimized for speed)
-RE_STRIP_TAGS = re.compile(r"<(script|style|nav|footer|header|aside|noscript)[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
+RE_STRIP_TAGS = re.compile(
+    r"<(script|style|nav|footer|header|aside|noscript|iframe|svg|form)[^>]*>.*?</\1>",
+    re.DOTALL | re.IGNORECASE,
+)
 RE_COMMENTS = re.compile(r"<!--.*?-->", re.DOTALL)
 RE_TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 RE_JSON_LD = re.compile(
@@ -250,7 +253,6 @@ def print_usage_stats(quality: bool = False) -> None:
     modes: Counter = Counter()
     days: Counter = Counter()
     domain_ok: Counter = Counter()    # domain → successful fetches
-    domain_short: Counter = Counter()  # domain → short page count
 
     with open(log_path) as f:
         for line in f:
@@ -444,7 +446,6 @@ def is_blocked_content(content: str) -> bool:
     return any(marker in content_lower for marker in BLOCKED_CONTENT_MARKERS)
 
 
-
 def _strip_wiki_tables(html: str) -> str:
     """Remove Wikipedia infobox/navbox tables (may contain nested tables)."""
     for css_class in ("infobox", "navbox"):
@@ -492,10 +493,7 @@ def _extract_with_trafilatura(html: str) -> str:
 def _extract_with_regex(html: str) -> str:
     """Fallback: extract text from HTML using regex (for when trafilatura returns nothing)."""
     # Strip boilerplate tags
-    html = re.compile(
-        r"<(script|style|nav|footer|header|aside|noscript|iframe|svg|form)[^>]*>.*?</\1>",
-        re.DOTALL | re.IGNORECASE,
-    ).sub("", html)
+    html = RE_STRIP_TAGS.sub("", html)
     html = RE_COMMENTS.sub("", html)
 
     html = RE_BR.sub("\n", html)
@@ -1009,7 +1007,7 @@ async def fetch_single_async(
     try:
         # API fast-path: use native APIs for sites that produce cleaner output than scraping
         api_content = None
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         wiki_match = RE_WIKIPEDIA_URL.match(url)
         if wiki_match:
             lang, title = wiki_match.group(1), wiki_match.group(2)
@@ -1083,9 +1081,9 @@ async def fetch_single_async(
             raw_html = raw_html[:MAX_CONTENT_BYTES]
 
         if _is_pdf(raw_html, url):
-            # PDF: extract via pandoc in process pool
+            # PDF: extract via pdftotext in process pool
             raw_body = page.body if isinstance(page.body, bytes) else raw_html.encode("utf-8", errors="replace")
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             content = await loop.run_in_executor(
                 _get_extract_pool(), _extract_pdf, raw_body
             )
@@ -1104,7 +1102,7 @@ async def fetch_single_async(
             return FetchResult(url=url, success=False, error="CAPTCHA/blocked")
 
         # Extract text + JSON-LD in process pool (CPU-bound, don't block event loop)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         content, structured = await loop.run_in_executor(
             _get_extract_pool(), _extract_content, raw_html
         )
@@ -1210,7 +1208,7 @@ class BraveSearch:
 
 def _detect_ddg_region(query: str) -> Optional[str]:
     """Detect DDG region from query script (Unicode ranges). Returns None for Latin."""
-    scripts = {"ja": 0, "zh": 0, "ko": 0, "ru": 0, "ar": 0, "th": 0}
+    scripts = {"ja": 0, "zh": 0, "ko": 0}
     for ch in query:
         cp = ord(ch)
         if 0x3040 <= cp <= 0x30FF or 0x31F0 <= cp <= 0x31FF:  # Hiragana + Katakana
@@ -1219,12 +1217,6 @@ def _detect_ddg_region(query: str) -> Optional[str]:
             scripts["zh"] += 1  # tentative — overridden by ja if kana present
         elif 0xAC00 <= cp <= 0xD7AF or 0x1100 <= cp <= 0x11FF:  # Hangul
             scripts["ko"] += 1
-        elif 0x0400 <= cp <= 0x04FF:  # Cyrillic
-            scripts["ru"] += 1
-        elif 0x0600 <= cp <= 0x06FF:  # Arabic
-            scripts["ar"] += 1
-        elif 0x0E00 <= cp <= 0x0E7F:  # Thai
-            scripts["th"] += 1
     # If kana detected, CJK chars are also Japanese
     if scripts["ja"] > 0:
         scripts["ja"] += scripts["zh"]
@@ -1232,8 +1224,6 @@ def _detect_ddg_region(query: str) -> Optional[str]:
     top = max(scripts, key=scripts.get)
     if scripts[top] == 0:
         return None
-    # Only CJK scripts benefit from region hints — Cyrillic/Arabic/Thai regional
-    # domains tend to have more aggressive bot protection, causing lower fetch rates
     region_map = {"ja": "jp-jp", "zh": "zh-cn", "ko": "kr-kr"}
     return region_map.get(top)
 
@@ -1356,20 +1346,16 @@ async def run_research_async(
     fetch_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
     result_queue: asyncio.Queue[Optional[FetchResult]] = asyncio.Queue()
     stats = ResearchStats(query=config.query)
-    search_source = ""
 
     async def search_producer() -> None:
-        nonlocal search_source
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         searcher = MultiSearch()
         t0 = time.monotonic()
 
-        ddg_count = 0
-        brave_count = 0
         skipped = 0
 
         def search_and_stream():
-            nonlocal ddg_count, brave_count, skipped
+            nonlocal skipped
             enqueued = 0
             seen_in_search: Set[str] = set()
             for url, title, snippet in searcher.search(config.query, config.search_results):
@@ -1436,8 +1422,6 @@ async def run_research_async(
 
             with ThreadPoolExecutor(max_workers=2) as bonus_pool:
                 list(bonus_pool.map(lambda f: f(), [_bonus_news, _bonus_reddit]))
-
-            ddg_count = len(urls)
 
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
@@ -1546,7 +1530,7 @@ def _dedup_results(
     results: List[FetchResult],
     seen: Optional[Set[str]] = None,
     seen_fuzzy: Optional[Set[str]] = None,
-) -> List[FetchResult]:
+) -> Tuple[List[FetchResult], DedupStats]:
     """Remove duplicate sentences across pages (exact + fuzzy).
     Pass shared sets to dedup across multiple calls (e.g. multi-query)."""
     if seen is None:
@@ -1816,8 +1800,8 @@ Examples:
 
 Search: DDG primary + Brave fallback (set BRAVE_API_KEY env var or ~/.config/brave/api_key)
 Fetch: Scrapling AsyncFetcher (TLS fingerprinting)
-Extract: w3m > regex > Scrapling DOM parser (tiered fallback)
-Blocked domains: reddit, twitter, facebook, youtube, tiktok, instagram, linkedin, medium
+Extract: trafilatura > regex > Scrapling DOM parser (tiered fallback)
+Blocked domains: facebook, youtube, tiktok, instagram, linkedin
         """
     )
 
