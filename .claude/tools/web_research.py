@@ -820,6 +820,7 @@ RE_GITHUB_REPO_URL = re.compile(r'https?://github\.com/([^/]+)/([^/]+?)(?:/?|/tr
 RE_ARXIV_URL = re.compile(r'https?://arxiv\.org/(?:abs|pdf)/(\d+\.\d+)')
 RE_TWITTER_URL = re.compile(r'https?://(?:twitter\.com|x\.com)/([^/]+)/status/(\d+)')
 RE_REDDIT_URL = re.compile(r'https?://(?:www\.)?reddit\.com(/r/[^?#]+)')
+RE_SEMANTIC_SCHOLAR_URL = re.compile(r'https?://(?:www\.)?semanticscholar\.org/paper/(?:.+/)?([a-f0-9]{40})')
 
 def _fetch_wikipedia_api(lang: str, title: str, max_length: int) -> Optional[str]:
     """Fetch clean text from Wikipedia API (no scraping needed)."""
@@ -895,6 +896,38 @@ def _fetch_arxiv_api(paper_id: str, max_length: int) -> Optional[str]:
     except Exception:
         pass
     return None
+
+def _fetch_semantic_scholar_api(paper_hash: str, max_length: int) -> Optional[str]:
+    """Fetch Semantic Scholar paper metadata + abstract via API (free, no key)."""
+    import urllib.request
+    api_url = f"https://api.semanticscholar.org/graph/v1/paper/{paper_hash}?fields=title,abstract,authors,year,citationCount,venue"
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        title = data.get("title", "Unknown")
+        abstract = data.get("abstract") or ""
+        authors = [a.get("name", "") for a in (data.get("authors") or [])]
+        year = data.get("year")
+        citations = data.get("citationCount")
+        venue = data.get("venue") or ""
+        parts = [f"# {title}\n"]
+        if authors:
+            parts.append(f"Authors: {', '.join(authors[:10])}")
+        if year:
+            parts.append(f"Year: {year}")
+        if venue:
+            parts.append(f"Venue: {venue}")
+        if citations is not None:
+            parts.append(f"Citations: {citations}")
+        if abstract:
+            parts.append(f"\n## Abstract\n\n{abstract}")
+        text = "\n".join(parts)
+        return text[:max_length] if text else None
+    except Exception:
+        pass
+    return None
+
 
 def _fetch_twitter_api(screen_name: str, tweet_id: str, max_length: int) -> Optional[str]:
     """Fetch tweet text via FxTwitter API (no auth required)."""
@@ -1026,6 +1059,27 @@ async def fetch_single_async(
             api_content = await loop.run_in_executor(
                 None, _fetch_arxiv_api, paper_id, max_content_length
             )
+        # Semantic Scholar: try regex first, then fallback to string extraction
+        if not api_content and 'semanticscholar.org/paper/' in url:
+            s2_match = RE_SEMANTIC_SCHOLAR_URL.match(url)
+            paper_hash = s2_match.group(1) if s2_match else None
+            if not paper_hash:
+                # Fallback: extract last path segment as paperId
+                path = url.split('semanticscholar.org/paper/')[-1].split('?')[0].rstrip('/')
+                candidate = path.split('/')[-1]
+                if len(candidate) == 40 and all(c in '0123456789abcdef' for c in candidate.lower()):
+                    paper_hash = candidate
+            if paper_hash:
+                api_content = await loop.run_in_executor(
+                    None, _fetch_semantic_scholar_api, paper_hash, max_content_length
+                )
+            if not api_content:
+                # S2 website returns HTTP 202 for programmatic access — skip Scrapling
+                elapsed = time.monotonic() - t0
+                s2_domain = urllib.parse.urlparse(url).netloc
+                if progress:
+                    progress.message(f"    --  {elapsed:5.1f}s  {s2_domain} (S2 API unavailable)")
+                return FetchResult(url=url, success=False, error="S2 API unavailable")
         tw_match = RE_TWITTER_URL.match(url) if not api_content else None
         if tw_match:
             screen_name, tweet_id = tw_match.group(1), tw_match.group(2)
@@ -1204,6 +1258,41 @@ class BraveSearch:
         except Exception as e:
             logger.debug(f"Brave search failed: {e}")
             return
+
+
+_ACADEMIC_STRONG = (
+    "paper", "papers", "preprint", "arxiv", "pubmed", "doi:",
+    "meta-analysis", "systematic review", "clinical trial",
+    "literature review", "peer-review", "journal article",
+)
+_ACADEMIC_WEAK = (
+    "research", "study", "studies", "algorithm", "neural",
+    "genome", "protein", "quantum", "theorem", "benchmark",
+    "dataset", "experiment", "hypothesis", "molecular",
+    "computational", "optimization", "evaluation", "survey",
+    "simulation", "methodology", "technique",
+    "prediction", "detection", "classification",
+    "learning", "training", "computing",
+    "correction", "encoding", "decoding", "synthesis",
+    "imaging", "catalyst", "receptor", "enzyme",
+    "biodiversity", "ecosystem", "acidification",
+    "emission", "photovoltaic", "semiconductor",
+    "neuroscience", "cortex", "cognitive",
+    "clinical", "therapeutic", "diagnostic",
+    "mechanism", "architecture", "model",
+    "reinforcement", "robotics", "autonomous",
+    "generative", "diffusion", "transformer",
+)
+
+
+def _is_academic_query(query: str) -> bool:
+    """Heuristic: does this query likely seek academic/scientific content?
+    Strong signals (any 1): paper, arxiv, clinical trial, etc.
+    Weak signals (need 2+): research, algorithm, neural, model, etc."""
+    q = query.lower()
+    if any(s in q for s in _ACADEMIC_STRONG):
+        return True
+    return sum(1 for w in _ACADEMIC_WEAK if w in q) >= 2
 
 
 def _detect_ddg_region(query: str) -> Optional[str]:
@@ -1420,8 +1509,53 @@ async def run_research_async(
                 except Exception:
                     pass
 
-            with ThreadPoolExecutor(max_workers=2) as bonus_pool:
-                list(bonus_pool.map(lambda f: f(), [_bonus_news, _bonus_reddit]))
+            def _bonus_arxiv():
+                """Search arXiv API for relevant papers (free, no key)."""
+                try:
+                    import urllib.request
+                    import xml.etree.ElementTree as ET
+                    encoded = urllib.parse.quote_plus(config.query)
+                    api_url = f"http://export.arxiv.org/api/query?search_query=all:{encoded}&start=0&max_results=5&sortBy=relevance"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        xml_data = resp.read().decode("utf-8", errors="replace")
+                    root = ET.fromstring(xml_data)
+                    ns = {"atom": "http://www.w3.org/2005/Atom"}
+                    for entry in root.findall("atom:entry", ns):
+                        for link in entry.findall("atom:link", ns):
+                            href = link.get("href", "")
+                            if "arxiv.org/abs/" in href:
+                                _enqueue_bonus(href)
+                                break
+                except Exception:
+                    pass
+
+            def _bonus_semantic_scholar():
+                """Search Semantic Scholar API for papers (free, no key, 1 req/s)."""
+                try:
+                    import urllib.request
+                    encoded = urllib.parse.quote_plus(config.query)
+                    api_url = f"https://api.semanticscholar.org/graph/v1/paper/search?query={encoded}&limit=5&fields=url,externalIds"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    for paper in (data.get("data") or []):
+                        ext_ids = paper.get("externalIds") or {}
+                        arxiv_id = ext_ids.get("ArXiv")
+                        if arxiv_id:
+                            _enqueue_bonus(f"https://arxiv.org/abs/{arxiv_id}")
+                        else:
+                            paper_id = paper.get("paperId", "")
+                            if paper_id:
+                                _enqueue_bonus(f"https://www.semanticscholar.org/paper/{paper_id}")
+                except Exception:
+                    pass
+
+            bonus_fns = [_bonus_news, _bonus_reddit]
+            if _is_academic_query(config.query):
+                bonus_fns.extend([_bonus_arxiv, _bonus_semantic_scholar])
+            with ThreadPoolExecutor(max_workers=len(bonus_fns)) as bonus_pool:
+                list(bonus_pool.map(lambda f: f(), bonus_fns))
 
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:

@@ -25,7 +25,7 @@ This agent uses DuckDuckGo to fetch and process 50+ pages per query — similar 
 - **Smart Extraction**: Trafilatura content-area detection (article body, not nav/sidebar noise)
 - **Token Compression**: Sentence-level BM25 + centrality scoring keeps the most relevant sentences within budget
 - **Cross-Page Dedup**: Removes duplicate sentences across pages so later results only add new information
-- **Bonus Sources**: Supplements web results with DDG News + Reddit discussions (searched in parallel)
+- **Bonus Sources**: Supplements web results with DDG News + Reddit discussions (searched in parallel), plus arXiv and Semantic Scholar for academic queries
 - **Observable**: Per-phase timing, failure breakdown, slow URL identification
 - **Zero Setup**: Auto-installs dependencies via uv
 
@@ -50,6 +50,18 @@ These websites are used via APIs:
 | en.wikipedia.org | MediaWiki API | Article text (no citation noise) |
 | github.com | GitHub REST API | README rendered to text |
 | arxiv.org | ArXiv Atom API | Paper metadata + abstract |
+| semanticscholar.org | Semantic Scholar API | Paper metadata + abstract + citations |
+
+## Academic Search
+
+For queries detected as scientific/academic, the tool automatically supplements web results with:
+
+- **arXiv API Search**: Queries arXiv for relevant papers (5 results, sorted by relevance)
+- **Semantic Scholar API Search**: Queries S2 for papers across all disciplines (5 results, prefers arXiv URLs when available)
+
+Detection uses keyword heuristics — strong signals (e.g., "paper", "clinical trial", "arxiv") trigger immediately; weak signals (e.g., "research", "algorithm", "quantum") require 2+ matches. Non-academic queries skip these bonuses entirely.
+
+All APIs are free with no keys required.
 
 Paywalled pages automatically fall back to Wayback Machine cached versions.
 
