@@ -31,13 +31,13 @@ You are a web research specialist. You find, evaluate, and synthesize informatio
 
 ```bash
 # Single query
-./.claude/tools/web_search.sh "query"
+./.opencode/tools/web_search.sh "query"
 
 # Multiple queries (parallel, deduped)
-./.claude/tools/web_search.sh "query 1" "query 2" "query 3"
+./.opencode/tools/web_search.sh "query 1" "query 2" "query 3"
 
 # Windows
-.claude/tools/web_search.bat "query"
+.opencode/tools/web_search.bat "query"
 ```
 
 ## Query Type Selection

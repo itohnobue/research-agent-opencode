@@ -1,16 +1,10 @@
 # Web Search Agent
 
-A web search agent for Claude Code and OpenCode that processes 50+ results per search — far beyond the typical 10-20 limit.
+A web search agent for OpenCode that processes 50+ results per search — far beyond the typical 10-20 limit.
 
-## Quick Start (Claude Code)
+## Quick Start
 
-1. **Copy files**: Put `.claude/` folder into your Claude Code working directory
-2. **Add instructions**: Copy `CLAUDE.md` contents into your project's instruction file
-3. **Test it**: Ask Claude to search the web, e.g., *"Search for most beautiful Hokusai paintings and explain why they're great"*
-
-## Quick Start (OpenCode)
-
-1. **Copy files**: Put `.claude/` and `.opencode/` folders into your project directory
+1. **Copy files**: Put `.opencode/` folder into your project directory
 2. **Add instructions**: Copy `AGENTS.md` to your project root
 3. **Test it**: Open OpenCode and ask to search, e.g., *"Search for most beautiful Hokusai paintings and explain why they're great"*
 
@@ -18,7 +12,7 @@ The wrapper scripts auto-install **uv**, which handles Python and dependencies.
 
 ## Why You Need This
 
-Most LLM tools (including Claude Code) only use 10-20 search results, limiting research depth.
+Most LLM tools only use 10-20 search results, limiting research depth.
 
 This agent uses DuckDuckGo to fetch and process 50+ pages per query — similar to Qwen's Search function but works with any LLM.
 
