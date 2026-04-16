@@ -1,12 +1,18 @@
 # Web Search Agent
 
-A web search agent for Claude Code (or any LLM) that processes 50+ results per search — far beyond the typical 10-20 limit.
+A web search agent for Claude Code and OpenCode that processes 50+ results per search — far beyond the typical 10-20 limit.
 
-## Quick Start
+## Quick Start (Claude Code)
 
 1. **Copy files**: Put `.claude/` folder into your Claude Code working directory
 2. **Add instructions**: Copy `CLAUDE.md` contents into your project's instruction file
 3. **Test it**: Ask Claude to search the web, e.g., *"Search for most beautiful Hokusai paintings and explain why they're great"*
+
+## Quick Start (OpenCode)
+
+1. **Copy files**: Put `.claude/` and `.opencode/` folders into your project directory
+2. **Add instructions**: Copy `AGENTS.md` to your project root
+3. **Test it**: Open OpenCode and ask to search, e.g., *"Search for most beautiful Hokusai paintings and explain why they're great"*
 
 The wrapper scripts auto-install **uv**, which handles Python and dependencies.
 
