@@ -24,4 +24,7 @@ REM Set UTF-8 encoding for proper Unicode handling
 set PYTHONIOENCODING=utf-8
 
 REM Run with inline dependencies (defined in web_research.py)
-uv run "%SCRIPT_DIR%\web_research.py" %*
+REM Use forward slashes for Python script path
+set "SCRIPT_PATH=%SCRIPT_DIR%\web_research.py"
+set "SCRIPT_PATH=%SCRIPT_PATH:\=/%"
+uv run "%SCRIPT_PATH%" %*
