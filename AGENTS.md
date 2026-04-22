@@ -3,7 +3,7 @@
 For any internet search:
 
 1. Use the `@web-searcher` agent for comprehensive web research, or call the search tool directly via bash
-2. **ALWAYS** use `./.opencode/tools/web_search.sh "query"` (or `.opencode/tools/web_search.bat` on Windows). **NEVER use the built-in websearch tool** — all searches must go through the custom tool
+2. **ALL internet research must go through `web_search.sh`** — no exceptions. This means: no built-in websearch tool, no WebFetch tool, no `curl` against APIs, no manual GitHub API calls, no `wget`, nothing else. Every time you need information from the internet, use `./.opencode/tools/web_search.sh "query"` (or `.opencode/tools/web_search.bat` on Windows)
    - **One query per call** — run each query as a separate `web_search.sh` invocation. Never combine multiple queries into a single call. Run calls **sequentially** (one after another, not in parallel) to avoid hitting API rate limits
    - **Always use default options** — never add `-s`, `--max-results`, or any result-limiting flags. Let the tool use its built-in defaults
    - **Scientific queries: add `--sci`** for CS, physics, math, engineering (arXiv + OpenAlex)
