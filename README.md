@@ -11,9 +11,10 @@ Most LLM search tools return 10-20 results, limiting research depth on complex q
 ```bash
 git clone https://github.com/itohnobue/research-agent-opencode
 cp -R research-agent-opencode/.opencode /path/to/your/project/
+cp research-agent-opencode/AGENTS.md /path/to/your/project/
 ```
 
-Then add `AGENTS.md` to your project root. Test it: *"Search for the most performant Rust web frameworks in 2025"*
+If you already have an `AGENTS.md`, append this one instead of overwriting. This teaches OpenCode to route all web searches through this tool. Test it: *"Search for the most performant Rust web frameworks in 2025"*
 
 Auto-installs Python dependencies via `uv` on first run. No API keys required.
 
