@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["scrapling[fetchers]", "ddgs", "trafilatura", "rank-bm25", "httpx"]
+# dependencies = ["scrapling[fetchers]", "ddgs", "trafilatura", "rank-bm25", "httpx", "fastembed"]
 # ///
 # -*- coding: utf-8 -*-
 """
@@ -12,13 +12,18 @@ Unified tool combining search and fetch into a single optimized workflow:
 2. Filter and deduplicate URLs during search (early filtering)
 3. Fetch content in parallel via Scrapling (TLS fingerprinting, anti-bot bypass)
 4. Scrapling text extraction fallback for "Too short" pages
-5. Output combined results (streaming or batched)
+5. Search mode: full filtered text is written to a report file in
+   tmp/webresearch/ (run-id.txt); stdout carries a compact digest
+   (stats + FULL REPORT path + per-page previews). The model researches
+   from the report file (read/grep), not from stdout.
+6. --url direct fetch stays inline raw output (single-page retrieval fallback)
 
 Usage:
     python web_research.py "search query"
-    python web_research.py "Mac Studio M3 Ultra LLM" --fetch 50
-    python web_research.py "AI trends 2025" -o markdown
-    python web_research.py "query" --stream  # Stream output as results arrive
+    python web_research.py "query" --sci | --med | --tech   # Domain bonus sources (arXiv, PubMed, HN/Stack Overflow/GitHub)
+    python web_research.py "query" --url https://example.com   # Direct fetch of specific URL(s) (skips search, inline output)
+
+(fixed tuned settings: search 30 results, fetch up to 20 pages, plain-text output)
 """
 
 from __future__ import annotations
@@ -28,8 +33,10 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import shutil
+import string
 import subprocess
 import sys
 import time
@@ -72,6 +79,24 @@ logger.propagate = False
 # CONSTANTS
 # =============================================================================
 
+# Fetch timeout for single-page fetches (seconds)
+DEFAULT_TIMEOUT: int = 5
+
+# Whole-run wall-clock timeout (seconds). Bounds the entire research run on ALL
+# platforms: search mode wraps the async core in asyncio.wait_for (Windows has
+# no SIGALRM), and the Unix SIGALRM watchdog covers the post-processing phase
+# outside the async core. Both mechanisms use this same value.
+# Env-overridable for ops/testing (read at import time).
+def _wall_timeout_default() -> int:
+    """Whole-run wall-clock timeout (seconds); env-overridable, fail-soft."""
+    raw = os.environ.get("WEB_RESEARCH_TIMEOUT_SECONDS", "")
+    if raw.isdigit():
+        return int(raw)
+    return 300
+
+
+WALL_TIMEOUT: int = _wall_timeout_default()
+
 BLOCKED_DOMAINS: Tuple[str, ...] = (
     "facebook.com", "tiktok.com", "instagram.com", "linkedin.com", "youtube.com",
     "msn.com",  # redirects to stub/privacy pages, no usable content
@@ -79,8 +104,11 @@ BLOCKED_DOMAINS: Tuple[str, ...] = (
     "forbes.com", "edmunds.com", "cars.com", "nytimes.com",
     "percona.com", "mctlaw.com", "zenodo.org", "amjmed.com", "dl.acm.org",
     "nejm.org", "cell.com", "sciencedirect.com", "onlinelibrary.wiley.com",
+    "reddit.com",  # subreddit homepages are empty title-only stubs — no research value
     # twitter.com, x.com: unblocked — FxTwitter API for tweet text
-    # reddit.com: unblocked — DDG snippets for bonus search, scraping fallback for DDG-found URLs
+    # reddit.com: blocked — subreddit pages are empty title-only stubs that give
+    # no research benefit; the substring matcher below covers www./old./np./new.
+    # and all other subdomains automatically
     # medium.com: unblocked — full articles extract cleanly
 )
 
@@ -180,6 +208,221 @@ _CURL_DNS_FAIL_DOMAINS: set = set()
 PDFTOTEXT_PATH = shutil.which("pdftotext")
 
 # =============================================================================
+# SMART CONTENT FILTERS (tunable)
+# =============================================================================
+# These constants tune the four content filters applied during compression:
+#   F1 boilerplate filter, F2 fact-density boost, F3 cross-page dedup, F4 sections.
+# Values were tuned against the real-search corpus (tmp/bm25-stats/corpus.jsonl).
+
+# F1 - boilerplate sentence patterns. Each pattern matches a junk sentence
+# (cookie/privacy banners, subscribe/share invites, copyright, nav fragments,
+# date-only lines). Tuned conservatively: only unambiguous junk phrases.
+BOILERPLATE_PATTERNS: Tuple[re.Pattern, ...] = (
+    # Cookie / privacy / consent banners
+    re.compile(
+        r"\b(?:we use cookies?|accept(?: all)? cookies?|manage cookies?|"
+        r"cookie (?:policy|settings|notice|preferences?|consent)|"
+        r"privacy (?:policy|notice)|gdpr)\b",
+        re.IGNORECASE,
+    ),
+    # Subscribe / signup / newsletter invites
+    re.compile(
+        r"\b(?:subscribe(?: to| now| for)?|sign\s?up(?: for| to| now)?|newsletter|"
+        r"join our (?:newsletter|mailing list|community)|get the latest|"
+        r"delivered to your inbox)\b",
+        re.IGNORECASE,
+    ),
+    # Follow / share / social invites
+    re.compile(
+        r"\b(?:follow us(?: on)?|follow @|share (?:this|on|via|the)|tweet this|"
+        r"pin it|like us on|add us on|connect with us)\b",
+        re.IGNORECASE,
+    ),
+    # Copyright / rights lines
+    re.compile(r"\b(?:copyright|\u00a9|\(c\)|all rights reserved|rights reserved)\b", re.IGNORECASE),
+    # Download / app / CTA junk
+    re.compile(
+        r"\b(?:download (?:our |the )?(?:app|application)|get (?:the )?app|"
+        r"available on (?:the )?(?:app store|google play)|read more|continue reading|"
+        r"click here|learn more|view all|see all|watch now|shop now|buy now|"
+        r"sign in|log in|register (?:now|free)?|create (?:an )?account)\b",
+        re.IGNORECASE,
+    ),
+    # Navigation / breadcrumb / related-content junk
+    re.compile(
+        r"\b(?:you are here|back to top|back to (?:the )?(?:home|article|top)|"
+        r"next (?:article|page|story)|previous (?:article|page|story)|"
+        r"related (?:posts|articles|stories)|recommended for you|you might also like|"
+        r"more from|top stories|trending now|most (?:read|popular)|"
+        r"popular (?:posts|articles|news)|latest (?:news|articles|posts)|"
+        r"table of contents|search results)\b",
+        re.IGNORECASE,
+    ),
+    # Date-only lines
+    re.compile(r"^\d{1,2}[./-]\d{1,2}[./-]\d{2,4}$"),
+    re.compile(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}$"),
+    re.compile(r"^[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4},?\s*(?:\d{1,2}:\d{2})?\s*(?:AM|PM)?$", re.IGNORECASE),
+    re.compile(r"^\d{1,2}\s+[A-Za-z]{3,9}\.?\s+\d{4}$", re.IGNORECASE),
+)
+
+# F2 - fact-density boost: score = blend * (1 + alpha * fact_density)
+FACT_DENSITY_ALPHA: float = 0.4
+
+# Common capitalized words that are NOT entity-like (F2 fact token exceptions)
+_FACT_CAP_EXCEPTIONS = frozenset(
+    "the this that these those it its we you they i my me our us your their his her he she "
+    "and but or not of in on at to from with for as by than then so there here when where why "
+    "how what which who whom while until during between about after before because although "
+    "however therefore also more most some such any all both each few other another one two "
+    "first second next last recent new many much same only just very too".split()
+)
+
+# F4 - heading-aware section selection: drop body sections whose heading matches
+# fewer than this fraction of query content words. 0.0 = drop only zero-overlap.
+HEADING_MATCH_THRESHOLD: float = 0.0
+
+# F3 - cross-page near-duplicate sentence dedup (batch path)
+CROSS_PAGE_JACCARD_THRESHOLD: float = 0.85   # Jaccard above this = near-dup; 0.0 = exact only
+CROSS_PAGE_DEDUP_MIN_LEN: int = 30           # only dedup lines at least this long
+
+# Minimum scoring pool size after F4/F1 filtering. Below this the BM25 idf
+# collapses (terms in 1 of N docs score ~0 with small N) and the page would
+# fall back to full-length output — so filtering gives up instead.
+MIN_SCORING_POOL: int = 15
+
+# =============================================================================
+# DIGEST + REPORT FILE (search-path output)
+# =============================================================================
+# Search mode writes the full filtered text to a report file under
+# <REPO_ROOT>/tmp/webresearch/ and prints a compact digest to stdout; the
+# model researches from the file (read/grep), not from the inline output.
+
+REPORT_DIR_NAME: str = "webresearch"        # subdirectory of <REPO_ROOT>/tmp/
+PREVIEW_CHARS: int = 600                    # digest preview length per page
+REPORT_PAGE_CEILING: int = 200_000          # per-page text ceiling in the file (memory sanity, NOT the 10k budget)
+REPORT_MAX_AGE_DAYS: int = 7                # rotation: delete files older than this
+REPORT_MAX_FILES: int = 30                  # rotation: keep only the N newest
+
+# F4 - section-level junk headings. Whole sections under these headings are
+# dropped when their heading shares no query tokens (see _filter_sections_by_heading).
+# Deliberately conservative: generic CONTENT headings (Abstract, Introduction,
+# Results, Methods, Ingredients, Instructions, FAQ, Pros/Cons, ...) are NOT listed —
+# real pages use creative headings that legitimately lack query words, and the
+# naive token-overlap filter was observed to delete real content on the corpus.
+SECTION_DROP_HEADING_PATTERNS: Tuple[re.Pattern, ...] = (
+    # Comments / discussion
+    re.compile(r"\b(?:comments?|commentary|join the discussion|leave a (?:comment|reply)|responses?|replies?)\b", re.IGNORECASE),
+    # Related / recommended / popular / latest / trending
+    re.compile(
+        r"\b(?:related (?:articles?|posts?|stories|reading)|you might also like|recommended (?:for you|reading)|"
+        r"more (?:from|to read)|popular (?:posts?|articles?|now)|trending(?: now)?|most (?:read|popular)|"
+        r"latest (?:news|articles?|posts?)|top (?:stories|posts?|articles?)|further reading|external links)\b",
+        re.IGNORECASE,
+    ),
+    # Nav / breadcrumb / TOC
+    re.compile(r"\b(?:table of contents|contents|search(?: results)?|site ?map|you are here|back to (?:top|home)|breadcrumbs?|next (?:article|post|page)|previous (?:article|post|page))\b", re.IGNORECASE),
+    # Author / about / contact boxes
+    re.compile(r"\b(?:about (?:the )?author|author bio|written by|byline|about us|contact us|our team|our writers)\b", re.IGNORECASE),
+    # Newsletter / subscribe / social
+    re.compile(r"\b(?:newsletter|subscribe|sign\s?up|join our (?:newsletter|mailing list)|share (?:this|the (?:article|post))|follow us|social (?:media|sharing))\b", re.IGNORECASE),
+    # Academic nav blocks (PubMed/arXiv/EuropePMC chrome)
+    re.compile(
+        r"\b(?:references|citations?|bibliography|works cited|footnotes?|endnotes?|linkout|full text sources|"
+        r"mesh terms|publication types|medical\s*$|miscellaneous|conflict of interest|grants? and funding|"
+        r"submission history|current browse context|other literature sources|author information|"
+        r"similar articles|related information|figures|supplementary)\b",
+        re.IGNORECASE,
+    ),
+    # Ads / sponsorship / legal
+    re.compile(
+        r"\b(?:advertisements?|sponsored|paid (?:promotion|post)|affiliate (?:links?|disclosure)|"
+        r"footer|cookie (?:policy|settings|notice)|privacy (?:policy|notice)|terms (?:of (?:use|service))?|"
+        r"legal|disclaimer)\b",
+        re.IGNORECASE,
+    ),
+    # Tag / category / archive lists
+    re.compile(r"\b(?:categories?|tags?|archives?)\b", re.IGNORECASE),
+)
+
+# =============================================================================
+# QUALITY FILTERS F5-F7 (tunable)
+# =============================================================================
+# Three quality filters layered on top of F1-F4, tuned against the same corpus
+# (tmp/bm25-stats/corpus.jsonl) and the motivating junk reports
+# (tmp/webresearch/20260814-*deepseek-harness*). All fail-soft: on any error the
+# filter does nothing and the pipeline keeps the unfiltered page set.
+
+# F5 - cross-domain syndication / content-farm detection (batch path, page level)
+FARM_PAGE_JACCARD_THRESHOLD: float = 0.85   # page-level shingle Jaccard = near-dup
+FARM_GROUP_MIN_PAGES: int = 3               # group must have this many pages
+FARM_GROUP_MIN_DOMAINS: int = 3             # ... across this many distinct registrable domains
+FARM_MIN_SIGNALS: int = 2                   # signals required to drop redundant copies
+FARM_HARD_SIGNALS: int = 3                  # signals required to drop the whole group (all copies)
+FARM_SIG_CHARS: int = 4000                  # chars of normalized body used for the page signature
+
+# F5 byline/author patterns: same author repeating across unrelated domains
+FARM_BYLINE_PATTERNS: Tuple[re.Pattern, ...] = (
+    re.compile(r"\bAbout\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)?)", re.IGNORECASE),
+    re.compile(r"\bBy\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)?)", re.IGNORECASE),
+    re.compile(r"\bBy\s+(?:Dr|Prof|Mr|Ms|Mrs|Miss|Sir|Dame|Fr|Rev)\.?\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)?)", re.IGNORECASE),
+    re.compile(r"\bwritten\s+by\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)?)", re.IGNORECASE),
+    re.compile(r"\bI'?m\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)?)\s*[—\-–]", re.IGNORECASE),
+    re.compile(r"\bAuthor\s*:\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)?)", re.IGNORECASE),
+)
+
+# F5 farm-network boilerplate phrases (maxgrowthagency-style PBN self-promotion)
+FARM_NETWORK_PATTERNS: Tuple[re.Pattern, ...] = (
+    re.compile(r"\balso on our network\b", re.IGNORECASE),
+    re.compile(r"\bkeep reading\b", re.IGNORECASE),
+    re.compile(r"\bmore from our network\b", re.IGNORECASE),
+    re.compile(r"\bread more at\b", re.IGNORECASE),
+    re.compile(r"\bwant my best\b", re.IGNORECASE),
+    re.compile(r"\bget access here\b", re.IGNORECASE),
+    re.compile(r"\bget inside\b", re.IGNORECASE),
+    re.compile(r"\bget my best\b", re.IGNORECASE),
+    re.compile(r"\bjoin my (?:private |free )?(?:group|community|course)\b", re.IGNORECASE),
+    re.compile(r"\bbook a free strategy session\b", re.IGNORECASE),
+    re.compile(r"\bDA\d+\s*[–—-]\s*\$", re.IGNORECASE),      # DA-tier pricing menus
+    re.compile(r"\b(?:free )?AI (?:Course|Community)\b", re.IGNORECASE),
+)
+
+# F6 - embedding-based semantic rerank (search path)
+RERANK_EMBEDDING_MODEL: str = "BAAI/bge-small-en-v1.5"  # fastembed default, 384-dim, MTEB ~62
+RERANK_EMBED_CHARS: int = 800               # title + first N chars of body used for the passage embedding
+RERANK_MAX_LEN: int = 600                   # only snippet-level pages (< min_content_length) are eligible for drop
+RERANK_STRICT_LEN: int = 200                # ultra-short stubs drop on absolute cosine alone (REL margin not needed)
+RERANK_MIN_SIM: float = 0.78                # absolute cosine floor — drop only clearly-below
+RERANK_REL_MARGIN: float = 0.06             # ... and at least this far below the query's best page
+RERANK_MIN_COVERAGE: float = 1.0            # page must cover ALL query content words to be safe
+RERANK_MIN_EN_RATIO: float = 0.15           # pages with less English function-word ratio are language-exempt
+
+# F7 - recency filter (search path)
+RECENCY_MAX_AGE_DAYS: int = 3 * 365         # drop pages older than this on recency-sensitive queries
+RECENCY_UNDATED_MAX_FRACTION: float = 0.5   # ≥50% undated pages → recency non-applicable (fail-soft)
+RECENCY_EVERGREEN_WORDS: Tuple[str, ...] = (
+    "history", "origins", "why do", "how to", "explained", "ethics",
+    "classic", "famous", "evolution", "what is", "tutorial", "guide",
+)
+RECENCY_SENSITIVE_WORDS: Tuple[str, ...] = (
+    "breaking changes", "new features", "release", "launch", "benchmark",
+    "update", "updated", "version", "comparison", "vs", "latest", "news",
+    "price", "today", "announce", "2026",
+)
+
+# Master toggle: WEB_RESEARCH_QUALITY=0 disables F5-F7 entirely (search mode).
+QUALITY_FILTERS_ENABLED: bool = os.environ.get("WEB_RESEARCH_QUALITY", "1") != "0"
+
+# Stub-page rule: a page is a stub when its extracted content is small AND holds
+# nothing beyond its own title/heading (forum/social homepages, empty product
+# listings). Calibrated on the corpus (tmp/bm25-stats/corpus.jsonl, 389 pages):
+# the smallest legit page is 641 chars (body 611), so total < 200 with body < 80
+# sits 441 chars below the smallest legit page while catching the observed
+# title-only stubs (68-103 chars). The AND keeps real small pages with actual
+# body text: a 180-char page with a 150-char body is not a stub.
+STUB_MAX_TOTAL_CHARS: int = 200
+STUB_MAX_BODY_CHARS: int = 80
+
+# =============================================================================
 # REQUIRED DEPENDENCIES (managed by uv)
 # =============================================================================
 
@@ -199,14 +442,13 @@ _scrapling_logger.setLevel(logging.CRITICAL)
 class ResearchConfig:
     """Configuration for research workflow."""
     query: str
-    fetch_count: int = 0
-    max_content_length: int = 8000
-    timeout: int = 20
+    fetch_count: int = 20
+    max_content_length: int = 10000
+    timeout: int = DEFAULT_TIMEOUT
     quiet: bool = False
     min_content_length: int = 600
     max_concurrent: int = 50  # Match default search count
-    search_results: int = 50
-    stream: bool = False
+    search_results: int = 30
     scientific: bool = False
     medical: bool = False
     tech: bool = False
@@ -567,9 +809,31 @@ def extract_title_from_content(content: str) -> str:
 
 MAX_CONTENT_BYTES = 2_000_000  # 2MB max content size
 
+def _jsonld_entries(data) -> List[dict]:
+    """Flatten a parsed JSON-LD block into a list of entity dicts.
+
+    Handles @graph arrays and nested @type arrays (the tool previously only
+    read data[0] of a list, missing Article data nested in @graph).
+    """
+    if isinstance(data, list):
+        out: List[dict] = []
+        for item in data:
+            out.extend(_jsonld_entries(item))
+        return out
+    if not isinstance(data, dict):
+        return []
+    out = [data]
+    graph = data.get("@graph")
+    if isinstance(graph, list):
+        for item in graph:
+            out.extend(_jsonld_entries(item))
+    return out
+
+
 def extract_jsonld_metadata(html: str) -> str:
     """Extract only high-value metadata from JSON-LD that page text doesn't provide:
-    dateModified (staleness signal) and FAQPage Q&A pairs (hard to parse from DOM)."""
+    datePublished (recency signal), dateModified (staleness signal) and FAQPage
+    Q&A pairs (hard to parse from DOM)."""
     blocks = RE_JSON_LD.findall(html)
     if not blocks:
         return ""
@@ -580,42 +844,48 @@ def extract_jsonld_metadata(html: str) -> str:
         except (json.JSONDecodeError, ValueError):
             continue
 
-        if isinstance(data, list):
-            data = data[0] if data else {}
-        if not isinstance(data, dict):
-            continue
+        for entry in _jsonld_entries(data):
+            if not isinstance(entry, dict):
+                continue
 
-        ld_type = data.get("@type", "")
-        if isinstance(ld_type, list):
-            ld_type = ld_type[0] if ld_type else ""
+            ld_type = entry.get("@type", "")
+            if isinstance(ld_type, list):
+                ld_type = ld_type[0] if ld_type else ""
 
-        parts = []
+            parts = []
 
-        # FAQPage: Q&A pairs are genuinely hard to extract from rendered HTML
-        if ld_type == "FAQPage":
-            entities = data.get("mainEntity", [])
-            # Flatten nested lists (e.g. AWS uses [[{...}, {...}]])
-            if entities and isinstance(entities[0], list):
-                entities = [e for sub in entities for e in sub]
-            for entity in entities[:5]:
-                if not isinstance(entity, dict):
-                    continue
-                q = entity.get("name", "")
-                a_obj = entity.get("acceptedAnswer", {})
-                a = a_obj.get("text", "") if isinstance(a_obj, dict) else ""
-                if q and a:
-                    parts.append(f"Q: {q}")
-                    parts.append(f"A: {a[:300]}")
+            # FAQPage: Q&A pairs are genuinely hard to extract from rendered HTML
+            if ld_type == "FAQPage":
+                entities = entry.get("mainEntity", [])
+                # Flatten nested lists (e.g. AWS uses [[{...}, {...}]])
+                if entities and isinstance(entities[0], list):
+                    entities = [e for sub in entities for e in sub]
+                for entity in entities[:5]:
+                    if not isinstance(entity, dict):
+                        continue
+                    q = entity.get("name", "")
+                    a_obj = entity.get("acceptedAnswer", {})
+                    a = a_obj.get("text", "") if isinstance(a_obj, dict) else ""
+                    if q and a:
+                        parts.append(f"Q: {q}")
+                        parts.append(f"A: {a[:300]}")
 
-        # dateModified: staleness signal not always visible in page text
-        date_mod = data.get("dateModified", "")
-        if date_mod:
-            if "T" in str(date_mod):
-                date_mod = str(date_mod).split("T")[0]
-            parts.append(f"updated: {date_mod}")
+            # datePublished: recency signal not always visible in page text
+            date_pub = entry.get("datePublished", "")
+            if date_pub:
+                if "T" in str(date_pub):
+                    date_pub = str(date_pub).split("T")[0]
+                parts.append(f"published: {date_pub}")
 
-        if parts:
-            return "[meta] " + " | ".join(parts) + "\n\n" if len(parts) == 1 else "[meta]\n" + "\n".join(parts) + "\n[/meta]\n\n"
+            # dateModified: staleness signal not always visible in page text
+            date_mod = entry.get("dateModified", "")
+            if date_mod:
+                if "T" in str(date_mod):
+                    date_mod = str(date_mod).split("T")[0]
+                parts.append(f"updated: {date_mod}")
+
+            if parts:
+                return "[meta] " + " | ".join(parts) + "\n\n" if len(parts) == 1 else "[meta]\n" + "\n".join(parts) + "\n[/meta]\n\n"
 
     return ""
 
@@ -624,25 +894,143 @@ def extract_jsonld_metadata(html: str) -> str:
 # URL FETCHER (Scrapling-based)
 # =============================================================================
 
-def _split_sentences(text: str) -> List[str]:
-    """Split text into sentences. Two-level: split on newlines, then on sentence boundaries."""
-    sentences: List[str] = []
-    for line in text.split("\n"):
-        line = line.strip()
-        if not line:
+# =============================================================================
+# SMART CONTENT FILTERS
+# =============================================================================
+
+def _is_boilerplate(sentence: str) -> bool:
+    """Model-free deterministic boilerplate detection (F1).
+
+    True for cookie/privacy banners, subscribe/share invites, copyright lines,
+    nav/breadcrumb fragments, date-only lines, and pure-punctuation/emoji/separator
+    lines. Applied to sentences BEFORE BM25 scoring so junk cannot steal budget
+    via the centrality weight (boilerplate repeats the most, so it scores high).
+    """
+    s = sentence.strip()
+    if not s:
+        return True
+    # Pure punctuation / emoji / separator lines (no letters or digits in any script)
+    if not re.search(r"[^\W_]", s, re.UNICODE):
+        return True
+    if len(s) <= 2:
+        return True
+    for pat in BOILERPLATE_PATTERNS:
+        if pat.search(s):
+            return True
+    return False
+
+
+def _fact_density(sentence: str) -> float:
+    """Fraction of fact-like tokens: numbers, percentages, years, currency, entity caps (F2)."""
+    tokens = re.findall(r"[A-Za-z0-9$€£¥%]+(?:\.\d+)?|[\u3400-\u9FFF]+", sentence)
+    if not tokens:
+        return 0.0
+    fact = 0
+    for t in tokens:
+        if re.search(r"\d|[$€£¥%]", t):
+            fact += 1
+        elif t[0].isupper() and len(t) >= 3 and t.lower() not in _FACT_CAP_EXCEPTIONS:
+            fact += 1
+    return fact / len(tokens)
+
+
+def _heading_query_tokens(query: str) -> Set[str]:
+    """Content words of the query used for heading matching (F4)."""
+    return {
+        w for w in re.findall(r"[a-zA-Z0-9\u00C0-\u024F]+", query.lower())
+        if len(w) >= 3 and w not in _STOP_WORDS
+    }
+
+
+def _heading_score(heading: str, q_tokens: Set[str]) -> float:
+    """Fraction of query content words appearing in a heading."""
+    if not q_tokens:
+        return 1.0
+    words = set(re.findall(r"[a-zA-Z0-9\u00C0-\u024F]+", heading.lower()))
+    return sum(1 for t in q_tokens if t in words) / len(q_tokens)
+
+
+def _is_junk_heading(heading: str) -> bool:
+    """True if the heading is a junk/nav section label (comments, related, references, ...)."""
+    return any(pat.search(heading) for pat in SECTION_DROP_HEADING_PATTERNS)
+
+
+def _filter_sections_by_heading(blocks: List[str], query: str, threshold: float) -> Tuple[List[str], int]:
+    """Drop body sections under junk headings that share no query tokens with the query (F4).
+
+    Runs before sentence-level selection to remove big irrelevant chunks early.
+    Only sections whose heading matches a junk/nav pattern are eligible for
+    dropping — generic content headings (Abstract, Introduction, Results, recipe
+    steps, ...) are always kept even when they lack query words. A dropped heading
+    drops all blocks until the next heading. Returns (kept_blocks, dropped_sections).
+    """
+    q_tokens = _heading_query_tokens(query)
+    if not q_tokens:
+        return blocks, 0
+    kept: List[str] = []
+    section_active = True  # blocks before any heading stay
+    dropped = 0
+    for block in blocks:
+        stripped = block.strip()
+        if stripped.startswith("# ") or stripped.startswith("## ") or stripped.startswith("### "):
+            if _is_junk_heading(stripped):
+                section_active = _heading_score(stripped, q_tokens) > threshold
+            else:
+                section_active = True
+            if not section_active:
+                dropped += 1
+                continue
+            kept.append(block)
             continue
-        # Short lines (headings, list items) stay as-is
-        if len(line) < 150:
-            sentences.append(line)
-        else:
-            # Split long lines on sentence boundaries
-            parts = RE_SENT_SPLIT.split(line)
-            sentences.extend(p.strip() for p in parts if p.strip())
-    return sentences
+        if section_active:
+            kept.append(block)
+    return kept, dropped
 
 
-def _compress_with_bm25(content: str, query: str, max_length: int) -> str:
-    """Query-focused extraction: keep sentences most relevant to query via BM25."""
+def _filter_junk_sections(blocks: List[str]) -> Tuple[List[str], int]:
+    """Drop body sections under junk headings (F4, no-query variant).
+
+    Same SECTION_DROP_HEADING_PATTERNS as the search path, but without a query
+    the overlap gate is vacuous (there is no query to overlap) — junk sections
+    are dropped outright. Generic content headings are never dropped, so real
+    content survives even when it has no query words. Blocks before the first
+    heading stay. Returns (kept_blocks, dropped_sections).
+    """
+    kept: List[str] = []
+    section_active = True  # blocks before any heading stay
+    dropped = 0
+    for block in blocks:
+        stripped = block.strip()
+        if stripped.startswith("# ") or stripped.startswith("## ") or stripped.startswith("### "):
+            section_active = not _is_junk_heading(stripped)
+            if not section_active:
+                dropped += 1
+            else:
+                kept.append(block)
+            continue
+        if section_active:
+            kept.append(block)
+    return kept, dropped
+
+
+def _prepare_sentences(
+    content: str,
+    query: str,
+    *,
+    use_sections: bool = True,
+    use_boilerplate: bool = True,
+    use_fact: bool = True,
+    heading_threshold: float = HEADING_MATCH_THRESHOLD,
+    fact_alpha: float = FACT_DENSITY_ALPHA,
+) -> dict:
+    """Parse content into header + scored body sentences (single source of truth).
+
+    Applies the smart filters before BM25 scoring:
+      F4 - drop body sections whose heading shares no query tokens
+      F1 - drop boilerplate sentences
+      F2 - fact-density boost on the 70/30 BM25+centrality blend
+    Returns dict with header_parts, sentences, scores, boilerplate_dropped, sections_dropped.
+    """
     from rank_bm25 import BM25Okapi
 
     # Split into paragraphs first to identify headers
@@ -658,15 +1046,49 @@ def _compress_with_bm25(content: str, query: str, max_length: int) -> str:
         else:
             body_text_parts.append(stripped)
 
+    result = {
+        "header_parts": header_parts,
+        "sentences": [],
+        "scores": [],
+        "boilerplate_dropped": 0,
+        "sections_dropped": 0,
+        "pool_fallback": False,
+    }
     if not body_text_parts:
-        return content[:max_length]
+        return result
 
-    # Split body into sentences for granular selection
-    body_text = "\n\n".join(body_text_parts)
-    sentences = _split_sentences(body_text)
+    all_sentences = _split_sentences("\n\n".join(body_text_parts))
+    if not all_sentences:
+        return result
 
+    candidate = all_sentences
+    if use_sections:
+        section_blocks, result["sections_dropped"] = _filter_sections_by_heading(
+            body_text_parts, query, heading_threshold
+        )
+        if section_blocks:
+            candidate = _split_sentences("\n\n".join(section_blocks))
+        else:
+            candidate = []
+    if use_boilerplate and candidate:
+        kept: List[str] = []
+        for s in candidate:
+            if _is_boilerplate(s):
+                result["boilerplate_dropped"] += 1
+            else:
+                kept.append(s)
+        candidate = kept
+
+    # Fail-soft: if filtering leaves too small a pool, BM25 idf collapses and the
+    # page would fall back to full-length output — use the unfiltered pool instead.
+    if len(candidate) < MIN_SCORING_POOL:
+        result["boilerplate_dropped"] = 0
+        result["sections_dropped"] = 0
+        result["pool_fallback"] = True
+        candidate = all_sentences
+    sentences = candidate
     if not sentences:
-        return content[:max_length]
+        return result
 
     # BM25 rank sentences by query relevance
     tokenized = [s.lower().split() for s in sentences]
@@ -703,9 +1125,26 @@ def _compress_with_bm25(content: str, query: str, max_length: int) -> str:
         for b, c in zip(bm25_scores, centrality)
     ]
 
-    # Select top-scoring sentences within budget
+    # F2: fact-density boost — factual sentences carry more value per token
+    if use_fact:
+        scores = [
+            s * (1.0 + fact_alpha * _fact_density(sent))
+            for s, sent in zip(scores, sentences)
+        ]
+
+    result["sentences"] = sentences
+    result["scores"] = scores
+    return result
+
+
+def _select_sentences(scores: List[float], sentences: List[str], budget: int) -> Tuple[List[str], int]:
+    """Select top-scoring sentences within budget (existing selection rule).
+
+    Returns (selected_texts_in_original_order, chars_used).
+    """
+    if not sentences:
+        return [], 0
     ranked = sorted(zip(scores, range(len(sentences)), sentences), reverse=True)
-    budget = max_length - sum(len(h) + 2 for h in header_parts)
     selected: List[Tuple[int, str]] = []  # (original_index, text)
     chars = 0
     # Minimum score threshold: at least 10% of max blended score
@@ -716,16 +1155,126 @@ def _compress_with_bm25(content: str, query: str, max_length: int) -> str:
         selected.append((idx, sent))
         chars += len(sent) + 1
 
-    if not selected:
+    selected.sort(key=lambda x: x[0])
+    return [s for _, s in selected], chars
+
+
+def _split_sentences(text: str) -> List[str]:
+    """Split text into sentences. Two-level: split on newlines, then on sentence boundaries."""
+    sentences: List[str] = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        # Short lines (headings, list items) stay as-is
+        if len(line) < 150:
+            sentences.append(line)
+        else:
+            # Split long lines on sentence boundaries
+            parts = RE_SENT_SPLIT.split(line)
+            sentences.extend(p.strip() for p in parts if p.strip())
+    return sentences
+
+
+def _compress_with_bm25(
+    content: str,
+    query: str,
+    max_length: int,
+    *,
+    use_sections: bool = True,
+    use_boilerplate: bool = True,
+    use_fact: bool = True,
+    heading_threshold: float = HEADING_MATCH_THRESHOLD,
+    fact_alpha: float = FACT_DENSITY_ALPHA,
+) -> str:
+    """Query-focused extraction: keep sentences most relevant to query via BM25.
+
+    Smart filters (all default on, fail-soft to unfiltered behavior):
+      F4 - drop body sections whose heading matches nothing in the query
+      F1 - drop boilerplate sentences before scoring (junk can't steal budget)
+      F2 - boost sentences with numbers/currency/entity-like facts
+    """
+    prep = _prepare_sentences(
+        content, query,
+        use_sections=use_sections, use_boilerplate=use_boilerplate, use_fact=use_fact,
+        heading_threshold=heading_threshold, fact_alpha=fact_alpha,
+    )
+    header_parts = prep["header_parts"]
+    sentences = prep["sentences"]
+    scores = prep["scores"]
+
+    if not sentences:
         return content[:max_length]
 
-    # Restore original order
-    selected.sort(key=lambda x: x[0])
-    parts = header_parts + [sent for _, sent in selected]
+    budget = max_length - sum(len(h) + 2 for h in header_parts)
+    selected_sents, chars = _select_sentences(scores, sentences, budget)
+
+    if not selected_sents:
+        return content[:max_length]
+
+    parts = header_parts + selected_sents
     result = "\n".join(parts)
     if chars >= budget:
         result += "\n[Compressed...]"
     return result
+
+
+def _filter_direct_fetch(content: str) -> str:
+    """Order-preserving junk removal for the direct URL-fetch path (no query).
+
+    Applies F4 (junk-section drop) then F1 (boilerplate sentence drop) with the
+    SAME pattern sets as the search path; the caller applies the length cap.
+    No re-ranking — content stays in original page order (the user asked for the
+    page, not a query digest). Fail-soft: never empties the page; if filtering
+    leaves fewer than MIN_SCORING_POOL sentences the page is returned unchanged
+    (a page that is mostly junk can't be helped, and dropping it risks destroying
+    content). On any error falls back to the raw content.
+    """
+    try:
+        blocks = content.split("\n\n")
+        header_parts: List[str] = []
+        body_text_parts: List[str] = []
+        for block in blocks:
+            stripped = block.strip()
+            if not stripped:
+                continue
+            if not body_text_parts and (stripped.startswith("# ") or stripped.startswith("[meta")):
+                header_parts.append(stripped)
+            else:
+                body_text_parts.append(stripped)
+        if not body_text_parts:
+            return content
+
+        # F4: drop body sections under junk headings (no-query variant)
+        section_blocks, _ = _filter_junk_sections(body_text_parts)
+        if not section_blocks:
+            return content
+
+        # F1: drop boilerplate sentences, original order preserved
+        sentences = _split_sentences("\n\n".join(section_blocks))
+        kept = [s for s in sentences if not _is_boilerplate(s)]
+        if len(kept) < MIN_SCORING_POOL:
+            return content
+
+        result = "\n".join(header_parts + kept).strip()
+        return result if result else content
+    except Exception:
+        return content
+
+
+def _filter_page_text(content: str) -> str:
+    """Filter-only path for the report file: F4 + F1, original order, no BM25.
+
+    The report file carries a page's full filtered text (no 10k budget cut, no
+    re-ranking, no fact-density boost) so grep can find terms the query never
+    mentioned. Reuses the direct-fetch F4/F1 filtering; adds a fail-soft guard
+    for the report contract: if filtering leaves the page nearly empty
+    (< ~500 chars), the original text is returned unchanged — never an empty page.
+    """
+    filtered = _filter_direct_fetch(content)
+    if filtered is not content and filtered and len(filtered) < 500:
+        return content
+    return filtered
 
 
 def _create_fetch_result(
@@ -737,10 +1286,15 @@ def _create_fetch_result(
 ) -> FetchResult:
     """Create FetchResult from content, applying length checks and truncation."""
     if content and len(content) >= min_length:
-        if len(content) > max_length:
-            if query:
+        if query:
+            if len(content) > max_length:
                 content = _compress_with_bm25(content, query, max_length)
-            else:
+        else:
+            # Direct fetch (--url): F1+F4 filters first so the cap holds
+            # cleaner content; filters never remove content that would have
+            # survived the cap (they only drop junk), fail-soft to raw.
+            content = _filter_direct_fetch(content)
+            if len(content) > max_length:
                 content = content[:max_length] + "\n\n[Truncated...]"
         return FetchResult(
             url=url,
@@ -848,7 +1402,6 @@ RE_WIKIPEDIA_URL = re.compile(r'https?://(\w+)\.wikipedia\.org/wiki/(.+?)(?:#.*)
 RE_GITHUB_REPO_URL = re.compile(r'https?://github\.com/([^/]+)/([^/]+?)(?:/?|/tree/[^/]+/?)?$')
 RE_ARXIV_URL = re.compile(r'https?://arxiv\.org/(?:abs|pdf)/(\d+\.\d+)')
 RE_TWITTER_URL = re.compile(r'https?://(?:twitter\.com|x\.com)/([^/]+)/status/(\d+)')
-RE_REDDIT_URL = re.compile(r'https?://(?:www\.)?reddit\.com(/r/[^?#]+)')
 RE_SEMANTIC_SCHOLAR_URL = re.compile(r'https?://(?:www\.)?semanticscholar\.org/paper/(?:.+/)?([a-f0-9]{40})')
 
 def _fetch_wikipedia_api(lang: str, title: str, max_length: int) -> Optional[str]:
@@ -992,45 +1545,6 @@ def _fetch_twitter_api(screen_name: str, tweet_id: str, max_length: int) -> Opti
         pass
     return None
 
-def _fetch_reddit_json(reddit_path: str, max_length: int) -> Optional[str]:
-    """Fetch Reddit post + comments via Reddit's public JSON API (no auth)."""
-    import urllib.request
-    # Reddit serves JSON when .json is appended to any URL
-    api_url = f"https://www.reddit.com{reddit_path}.json"
-    try:
-        req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0 (research)"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
-        if not isinstance(data, list) or not data:
-            return None
-        post = data[0]["data"]["children"][0]["data"]
-        title = post.get("title", "")
-        selftext = post.get("selftext", "")
-        score = post.get("score", 0)
-        subreddit = post.get("subreddit", "")
-        author = post.get("author", "")
-        parts = [f"# {title}\n"]
-        parts.append(f"r/{subreddit} | u/{author} | {score} points\n")
-        if selftext:
-            parts.append(selftext)
-        # Extract top comments
-        if len(data) >= 2:
-            comments = data[1]["data"]["children"]
-            for c in comments[:5]:
-                if c.get("kind") != "t1":
-                    continue
-                cd = c["data"]
-                c_score = cd.get("score", 0)
-                c_author = cd.get("author", "")
-                c_body = cd.get("body", "")
-                if c_body:
-                    parts.append(f"\n---\n**u/{c_author}** ({c_score} points):\n{c_body}")
-        text = "\n".join(parts)
-        return text[:max_length] if text else None
-    except Exception:
-        pass
-    return None
-
 def _fetch_wayback_fallback(url: str, max_length: int) -> Optional[str]:
     """Try Wayback Machine for a recent cached version of the page."""
     import urllib.request
@@ -1115,7 +1629,6 @@ async def fetch_single_async(
             api_content = await loop.run_in_executor(
                 None, _fetch_twitter_api, screen_name, tweet_id, max_content_length
             )
-        # Reddit: JSON API blocked (403) — skip API, fall through to scraping
         # For API-routed domains, if API failed, scraping won't help — bail early
         api_only = tw_match
         if api_content:
@@ -1443,36 +1956,6 @@ class MultiSearch:
 
 
 # =============================================================================
-# STREAMING OUTPUT
-# =============================================================================
-
-def format_result_raw(result: FetchResult) -> str:
-    """Format single result as raw text."""
-    return f"=== {result.url} ===\n{result.content}\n"
-
-
-def format_result_json(result: FetchResult) -> str:
-    """Format single result as JSON line."""
-    return json.dumps({
-        "url": result.url,
-        "title": result.title,
-        "content": result.content,
-        "source": result.source
-    }, ensure_ascii=False)
-
-
-def stream_results(
-    results: Iterator[FetchResult],
-    output_format: str = "raw"
-) -> Iterator[str]:
-    """Stream formatted results."""
-    formatter = format_result_json if output_format == "json" else format_result_raw
-    for result in results:
-        if result.success:
-            yield formatter(result)
-
-
-# =============================================================================
 # RESEARCH WORKFLOW
 # =============================================================================
 
@@ -1543,7 +2026,7 @@ async def run_research_async(
                 loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
                 enqueued += 1
 
-            # Run bonus searches in parallel (news + reddit)
+            # Run bonus searches in parallel (news + topic-specific sources)
             region = _detect_ddg_region(config.query)
             def _bonus_news():
                 try:
@@ -1555,37 +2038,6 @@ async def run_research_async(
                         url = r.get("url", "")
                         if url:
                             _enqueue_bonus(url, "news")
-                except Exception:
-                    pass
-
-            def _bonus_reddit():
-                """Search DDG for reddit discussions, inject snippet content directly
-                (reddit blocks all scraping/API access, so we use DDG snippets)."""
-                try:
-                    ddg = DDGS(verify=False)
-                    count = 0
-                    for r in ddg.text(f"{config.query} site:reddit.com", max_results=5):
-                        url = r.get("href", "")
-                        if not url or "reddit.com" not in url:
-                            continue
-                        if url in seen_in_search or not is_valid_url(url):
-                            continue
-                        if global_seen_urls is not None:
-                            if url in global_seen_urls:
-                                continue
-                            global_seen_urls.add(url)
-                        seen_in_search.add(url)
-                        title = r.get("title", "")
-                        body = r.get("body", "")
-                        content = f"# {title}\n\n{body}" if title else body
-                        if not content or len(content) < 50:
-                            continue
-                        result = FetchResult(url=url, success=True, content=content[:config.max_content_length])
-                        loop.call_soon_threadsafe(result_queue.put_nowait, result)
-                        urls.append(url)
-                        stats.urls_searched = len(urls)
-                        stats.bonus_sources["reddit"] = stats.bonus_sources.get("reddit", 0) + 1
-                        count += 1
                 except Exception:
                     pass
 
@@ -1800,7 +2252,7 @@ async def run_research_async(
                 except Exception:
                     pass
 
-            bonus_fns = [_bonus_news, _bonus_reddit]
+            bonus_fns = [_bonus_news]
             if config.scientific:
                 bonus_fns.extend([_bonus_arxiv, _bonus_openalex])
             if config.medical:
@@ -1924,7 +2376,7 @@ def _dedup_results(
     seen_fuzzy: Optional[Set[str]] = None,
 ) -> Tuple[List[FetchResult], DedupStats]:
     """Remove duplicate sentences across pages (exact + fuzzy).
-    Pass shared sets to dedup across multiple calls (e.g. multi-query)."""
+    Pass shared sets to dedup across multiple calls."""
     if seen is None:
         seen = set()
     if seen_fuzzy is None:
@@ -1981,7 +2433,7 @@ def _dedup_results(
             source=r.source,
         ))
 
-    # Log dedup effectiveness to stderr (visible with -v)
+    # Log dedup effectiveness at debug level
     if stats.chars_before > 0 and (stats.exact_dupes or stats.fuzzy_dupes):
         saved_pct = 100 * (1 - stats.chars_after / stats.chars_before)
         logger.debug(
@@ -1993,118 +2445,682 @@ def _dedup_results(
     return deduped, stats
 
 
-def _global_compress(
+def _shingles(s: str, k: int = 3) -> Set[str]:
+    """Word k-grams of a normalized sentence; whole sentence as one shingle if shorter."""
+    words = s.split()
+    if len(words) < k:
+        return {s}
+    return {" ".join(words[i:i + k]) for i in range(len(words) - k + 1)}
+
+
+def _dedup_cross_page_sentences(
     results: List[FetchResult],
-    query: str,
-    budget: int,
-) -> List[FetchResult]:
-    """Cross-page BM25 compression: keep most relevant sentences across all pages within budget.
-    Each page retains its header (title/meta) unconditionally; body sentences compete globally."""
-    from rank_bm25 import BM25Okapi
+    jaccard_threshold: float = CROSS_PAGE_JACCARD_THRESHOLD,
+    min_len: int = CROSS_PAGE_DEDUP_MIN_LEN,
+) -> Tuple[List[FetchResult], dict]:
+    """Cross-page near-duplicate sentence removal (F3), applied batch-wide in page order.
 
-    total_chars = sum(len(r.content) for r in results if r.success)
-    if total_chars <= budget:
-        return results
+    Normalized exact matching always applies; shingle-Jaccard near-dup detection
+    applies above jaccard_threshold (0.0 disables it). Only sentences already seen
+    on EARLIER pages are dropped — legitimate within-page repeats are kept. Applies
+    to verbatim pages too (they may contain cross-page mirrors). Never empties a
+    page: at least its first non-header body line survives.
+    Returns (results, stats dict).
+    """
+    seen_norm: Set[str] = set()
+    seen_shingles: Dict[str, List[int]] = {}  # shingle -> ids of kept sentences sharing it
+    stored_shingles: List[Set[str]] = []      # shingle set per kept sentence (id = index)
+    stats = {"chars_before": 0, "chars_after": 0, "exact_dropped": 0, "near_dropped": 0}
 
-    # Parse each page into header + body sentences
-    page_data: List[dict] = []
-    all_sentences: List[Tuple[int, int, str]] = []  # (page_idx, sent_idx, text)
-    for pi, r in enumerate(results):
+    out: List[FetchResult] = []
+    for r in results:
         if not r.success:
-            page_data.append({"header": [], "sentences": [], "result": r})
+            out.append(r)
             continue
         lines = r.content.split("\n")
-        header: List[str] = []
-        body_lines: List[str] = []
-        in_header = True
+        kept_lines: List[str] = []
+        page_norms: Set[str] = set()   # norms added by THIS page (never checked against)
+        page_ids: Set[int] = set()     # ids added by THIS page (never checked against)
+        stats["chars_before"] += len(r.content)
+
         for line in lines:
             stripped = line.strip()
-            if in_header and (stripped.startswith("# ") or stripped.startswith("[meta")):
-                header.append(line)
-            else:
-                in_header = False
-                body_lines.append(line)
-        sentences = _split_sentences("\n".join(body_lines))
-        page_data.append({"header": header, "sentences": sentences, "result": r})
-        for si, sent in enumerate(sentences):
-            all_sentences.append((pi, si, sent))
+            if not stripped:
+                kept_lines.append(line)
+                continue
+            # Headers, metadata and short lines pass through
+            if stripped.startswith("# ") or stripped.startswith("[meta"):
+                kept_lines.append(line)
+                continue
+            if len(stripped) < min_len:
+                kept_lines.append(line)
+                continue
+            norm = _normalize_sentence(stripped)
+            if not norm:
+                kept_lines.append(line)
+                continue
+            if norm in seen_norm:
+                if norm in page_norms:
+                    kept_lines.append(line)  # within-page repeat — keep
+                else:
+                    stats["exact_dropped"] += 1
+                continue
+            if jaccard_threshold > 0.0:
+                sh = _shingles(norm)
+                candidates: Set[int] = set()
+                for shg in sh:
+                    for cid in seen_shingles.get(shg, ()):
+                        if cid not in page_ids:
+                            candidates.add(cid)
+                dup = False
+                for cid in candidates:
+                    a = stored_shingles[cid]
+                    inter = len(sh & a)
+                    union = len(sh | a)
+                    if union and inter / union > jaccard_threshold:
+                        dup = True
+                        break
+                if dup:
+                    stats["near_dropped"] += 1
+                    continue
+                if sh:
+                    sid = len(stored_shingles)
+                    for shg in sh:
+                        seen_shingles.setdefault(shg, []).append(sid)
+                    stored_shingles.append(sh)
+                    page_ids.add(sid)
+            seen_norm.add(norm)
+            page_norms.add(norm)
+            kept_lines.append(line)
 
-    if not all_sentences:
-        return results
-
-    # BM25 score all sentences globally
-    tokenized = [s.lower().split() for _, _, s in all_sentences]
-    bm25 = BM25Okapi(tokenized)
-    scores = bm25.get_scores(query.lower().split())
-
-    # Rank and select within budget
-    header_budget = sum(
-        sum(len(h) + 1 for h in pd["header"])
-        for pd in page_data
-    )
-    body_budget = budget - header_budget
-
-    ranked = sorted(zip(scores, range(len(all_sentences))), reverse=True)
-    selected: Set[Tuple[int, int]] = set()  # (page_idx, sent_idx)
-    chars_used = 0
-    for score, idx in ranked:
-        if chars_used >= body_budget:
-            break
-        pi, si, sent = all_sentences[idx]
-        selected.add((pi, si))
-        chars_used += len(sent) + 1
-
-    # Rebuild pages with only selected sentences (in original order)
-    compressed: List[FetchResult] = []
-    pages_trimmed = 0
-    for pi, pd in enumerate(page_data):
-        r = pd["result"]
-        if not r.success:
-            compressed.append(r)
+        # Never empty a page: ensure at least one non-header body line survives
+        if not any(l.strip() and not l.strip().startswith(("# ", "[meta")) for l in kept_lines):
+            for line in lines:
+                stripped = line.strip()
+                if stripped and not stripped.startswith(("# ", "[meta")):
+                    kept_lines.append(line)
+                    break
+        new_content = "\n".join(kept_lines).strip()
+        stats["chars_after"] += len(new_content)
+        if not new_content:
             continue
-        kept = list(pd["header"])
-        page_selected = sorted(si for (p, si) in selected if p == pi)
-        for si in page_selected:
-            kept.append(pd["sentences"][si])
-        new_content = "\n".join(kept).strip()
-        if len(new_content) < 50:
-            pages_trimmed += 1
-            continue
-        if len(new_content) < len(r.content):
-            pages_trimmed += 1
-        compressed.append(FetchResult(
+        out.append(FetchResult(
             url=r.url, success=True, content=new_content,
             title=r.title, source=r.source,
         ))
 
-    new_total = sum(len(r.content) for r in compressed if r.success)
-    saved_pct = 100 * (1 - new_total / total_chars)
-    logger.debug(
-        f"Global compress: {total_chars:,} → {new_total:,} chars "
-        f"({saved_pct:.0f}% saved, budget {budget:,}, {pages_trimmed} pages trimmed)"
-    )
-    return compressed
+    # Log dedup effectiveness at debug level
+    if stats["chars_before"] > 0 and (stats["exact_dropped"] or stats["near_dropped"]):
+        saved_pct = 100 * (1 - stats["chars_after"] / stats["chars_before"])
+        logger.debug(
+            f"Cross-page dedup: {stats['chars_before']:,} → {stats['chars_after']:,} chars "
+            f"({saved_pct:.2f}% saved, {stats['exact_dropped']} exact + "
+            f"{stats['near_dropped']} near-dup drops)"
+        )
+
+    return out, stats
+
+
+# =============================================================================
+# QUALITY FILTERS F5-F7 (batch path)
+# =============================================================================
+# F5: cross-domain content-farm / syndication detection (page-level).
+# F6: embedding-based semantic rerank (homonym drift).
+# F7: recency filter (stale pages on recency-sensitive queries).
+# All three are conservative, fail-soft (errors -> no filtering), and operate
+# ONLY on the batch search path (never on single --url fetches).
+
+
+def _registrable_domain(netloc: str) -> str:
+    """Registrable domain: last two labels (www.example.co.uk -> co.uk is coarse
+    but consistent with the tool's existing domain handling)."""
+    labels = netloc.lower().split(".")
+    if len(labels) >= 2:
+        return ".".join(labels[-2:])
+    return netloc
+
+
+def _page_body_signature(content: str, limit: int = FARM_SIG_CHARS) -> str:
+    """Normalized body text used for page-level similarity: strips header/meta
+    lines, lowercases, removes punctuation, collapses whitespace, caps length."""
+    lines = []
+    for line in content.split("\n"):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("# ") or stripped.startswith("[meta"):
+            continue
+        lines.append(stripped)
+    body = " ".join(lines)[:limit]
+    body = _normalize_sentence(body)
+    return body
+
+
+def _shingle_jaccard(a: str, b: str) -> float:
+    """Shingle-Jaccard similarity between two normalized texts."""
+    if not a or not b:
+        return 0.0
+    sa = _shingles(a)
+    sb = _shingles(b)
+    inter = len(sa & sb)
+    union = len(sa | sb)
+    if not union:
+        return 0.0
+    return inter / union
+
+
+def _extract_byline_names(content: str) -> Set[str]:
+    """Author names from byline/author-bio patterns ('By X', 'About X',
+    'written by X', 'I'm X —', 'By Dr. X'). Lowercased, deduped."""
+    names: Set[str] = set()
+    for pat in FARM_BYLINE_PATTERNS:
+        for m in pat.finditer(content[:4000]):
+            raw = m.group(1).strip()
+            name = raw.lower()
+            # Require a plausible personal name (at least 2 alpha words or 1 long word)
+            words = [w for w in re.split(r"\s+", name) if w.isalpha()]
+            if not words:
+                continue
+            if len(words) >= 2 or len(name) >= 5:
+                names.add(name)
+    return names
+
+
+def _has_farm_boilerplate(content: str) -> bool:
+    """True if the page carries farm-network self-promotion phrases."""
+    return any(pat.search(content) for pat in FARM_NETWORK_PATTERNS)
+
+
+def _page_cross_links(content: str, group_netlocs: List[str]) -> bool:
+    """True if the page text mentions another group member's registrable domain
+    (the 'read on our network' cross-link pattern)."""
+    lower = content.lower()
+    for netloc in group_netlocs:
+        reg = _registrable_domain(netloc)
+        # Match bare domain or a URL containing it
+        if reg in lower and reg not in {"com", "net", "org"}:
+            return True
+    return False
+
+
+def _dedup_farm_pages(
+    results: List[FetchResult],
+    jaccard_threshold: float = FARM_PAGE_JACCARD_THRESHOLD,
+    min_pages: int = FARM_GROUP_MIN_PAGES,
+    min_domains: int = FARM_GROUP_MIN_DOMAINS,
+    min_signals: int = FARM_MIN_SIGNALS,
+    hard_signals: int = FARM_HARD_SIGNALS,
+) -> Tuple[List[FetchResult], dict]:
+    """F5: drop cross-domain content-farm / syndication groups (page level).
+
+    Groups pages whose body-text shingle-Jaccard similarity exceeds
+    jaccard_threshold AND whose registrable domains differ. A group is a farm
+    candidate only when it spans >= min_pages pages across >= min_domains
+    distinct domains (near-identical content across unrelated domains). To
+    actually DROP pages, the group must carry >= min_signals independent
+    signals: (a) multi-domain near-dup (inherent), (b) byline/author
+    repetition, (c) farm boilerplate phrases, (d) cross-links between members.
+
+    Canonical-origin rule: with 2+ signals the redundant copies are dropped but
+    the first-fetched representative (canonical) is kept — a copy that looks
+    like legitimate syndication (same article mirrored on a partner site) is
+    never the sole survivor. With >= hard_signals (confirmed PBN: byline +
+    boilerplate + cross-links all present) the whole group is dropped.
+    When in doubt (fewer than min_signals) nothing is dropped.
+
+    Fail-soft: on any error returns the input unchanged.
+    Returns (results, stats dict).
+    """
+    try:
+        if not QUALITY_FILTERS_ENABLED:
+            return results, {"farm_dropped": 0, "groups": 0}
+        ok = [r for r in results if r.success]
+        if len(ok) < min_pages:
+            return results, {"farm_dropped": 0, "groups": 0}
+
+        # Signatures for the pages we can compare
+        sigs: List[Optional[str]] = []
+        netlocs: List[str] = []
+        for r in results:
+            if r.success:
+                sigs.append(_page_body_signature(r.content))
+                netlocs.append(urllib.parse.urlparse(r.url).netloc)
+            else:
+                sigs.append(None)
+                netlocs.append("")
+
+        # Union-find over near-dup pairs from DIFFERENT registrable domains
+        parent = list(range(len(results)))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for i in range(len(results)):
+            if not results[i].success or not sigs[i]:
+                continue
+            for j in range(i + 1, len(results)):
+                if not results[j].success or not sigs[j]:
+                    continue
+                if _registrable_domain(netlocs[i]) == _registrable_domain(netlocs[j]):
+                    continue
+                if _shingle_jaccard(sigs[i], sigs[j]) >= jaccard_threshold:
+                    union(i, j)
+
+        # Group members by root
+        groups: Dict[int, List[int]] = {}
+        for i in range(len(results)):
+            if results[i].success:
+                groups.setdefault(find(i), []).append(i)
+
+        dropped: Set[int] = set()
+        group_count = 0
+        for members in groups.values():
+            if len(members) < min_pages:
+                continue
+            domains = {_registrable_domain(netlocs[i]) for i in members}
+            if len(domains) < min_domains:
+                continue
+            group_count += 1
+
+            # Signal (a): multi-domain near-dup — inherent for eligible groups.
+            # Signal (b): byline repetition — same author on >= 2 members.
+            byline_sets = [_extract_byline_names(results[i].content) for i in members]
+            common_bylines: Set[str] = set()
+            for s in byline_sets:
+                for name in s:
+                    if sum(1 for s2 in byline_sets if name in s2) >= 2:
+                        common_bylines.add(name)
+            signal_b = bool(common_bylines)
+
+            # Signal (c): farm boilerplate on any member.
+            signal_c = any(_has_farm_boilerplate(results[i].content) for i in members)
+
+            # Signal (d): cross-links — any member mentions another member's domain.
+            member_netlocs = [netlocs[i] for i in members]
+            signal_d = any(
+                _page_cross_links(results[i].content, [n for n in member_netlocs if n != netlocs[i]])
+                for i in members
+            )
+
+            signals = (1 if signal_b else 0) + (1 if signal_c else 0) + (1 if signal_d else 0)
+            if signals >= hard_signals:
+                dropped.update(members)
+            elif signals >= min_signals:
+                # Keep the first-fetched (canonical) representative; drop copies.
+                dropped.update(members[1:])
+
+        if not dropped:
+            return results, {"farm_dropped": 0, "groups": group_count}
+
+        out: List[FetchResult] = []
+        for i, r in enumerate(results):
+            if i in dropped:
+                continue
+            out.append(r)
+        return out, {"farm_dropped": len(dropped), "groups": group_count}
+    except Exception:
+        return results, {"farm_dropped": 0, "groups": 0}
+
+
+# --- Stub-page rule (structural) --------------------------------------------
+
+def _is_stub_page(content: str) -> bool:
+    """True when a page has essentially no body: the extracted content is small
+    AND contains nothing beyond its own title/heading (forum/social
+    homepages, empty product listings). Both conditions must hold so a small
+    page with real body text is never treated as a stub. Fail-soft: content
+    that cannot be measured is kept."""
+    if not isinstance(content, str) or not content:
+        return False
+    total = len(content)
+    if total >= STUB_MAX_TOTAL_CHARS:
+        return False
+    body_chars = 0
+    in_meta = False
+    for line in content.split("\n"):
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("[meta"):
+            in_meta = True
+            continue
+        if in_meta:
+            if "[/meta]" in s:
+                in_meta = False
+            continue
+        if s.startswith(("# ", "## ", "### ")):
+            continue
+        body_chars += len(s)
+    return body_chars < STUB_MAX_BODY_CHARS
+
+
+def _drop_stub_pages(
+    results: List[FetchResult],
+) -> Tuple[List[FetchResult], dict]:
+    """Drop stub pages (structural, no model). Gated by QUALITY_FILTERS_ENABLED,
+    batch path only. Fail-soft: on any error the page set is unchanged.
+    Returns (results, stats dict with 'stub_dropped')."""
+    stats: dict = {"stub_dropped": 0}
+    try:
+        if not QUALITY_FILTERS_ENABLED:
+            return results, stats
+        drop_ids = {id(r) for r in results if r.success and _is_stub_page(r.content)}
+        if not drop_ids:
+            return results, stats
+        stats["stub_dropped"] = len(drop_ids)
+        return [r for r in results if id(r) not in drop_ids], stats
+    except Exception:
+        logger.debug("stub filter failed; skipping")
+        return results, stats
+
+
+# --- F6: embedding rerank -----------------------------------------------------
+
+_rerank_model = None  # lazy singleton, initialized once per process
+
+
+def _get_rerank_model():
+    """Lazy singleton TextEmbedding model. Returns None on any failure (fail-soft)."""
+    global _rerank_model
+    if _rerank_model is not None:
+        return _rerank_model
+    try:
+        from fastembed import TextEmbedding
+        _rerank_model = TextEmbedding(model_name=RERANK_EMBEDDING_MODEL)
+        return _rerank_model
+    except Exception:
+        logger.debug("embedding model unavailable; rerank disabled")
+        return None
+
+
+def _rerank_page_text(content: str) -> str:
+    """Text used for the passage embedding: title (if any) + first N chars of body."""
+    title = ""
+    body = content
+    if content.startswith("# "):
+        nl = content.find("\n")
+        if nl > 0:
+            title = content[2:nl].strip()
+            idx = content.find("\n\n")
+            body = content[idx + 2:] if idx > 0 else content[nl + 1:]
+    return f"{title} {body}"[:RERANK_EMBED_CHARS].strip()
+
+
+# English function words used as a lightweight language signal (multilingual safety)
+_RERANK_EN_FUNC_WORDS = frozenset(
+    "the and of to in is that for it on with as at by this from be are was were has have had "
+    "not but they you he she we will would can could should may might more most other some such "
+    "only own very just about after before between during while because if then than too also "
+    "when where which what how who whom there here".split()
+)
+
+
+def _english_ratio(text: str) -> float:
+    """Fraction of alpha tokens that are common English function words.
+    English text typically has >0.15; German/multilingual pages are far below."""
+    words = re.findall(r"[a-zA-Z][a-zA-Z']*", text.lower())
+    if len(words) < 20:
+        return 0.5  # short snippet: cannot judge language — keep (not English-exempt)
+    return sum(1 for w in words if w in _RERANK_EN_FUNC_WORDS) / len(words)
+
+
+def _query_coverage(query: str, content: str) -> float:
+    """Fraction of query content words present in the page text (case-insensitive)."""
+    qt = [w for w in re.findall(r"[a-zA-Z0-9]+", query.lower()) if w not in _STOP_WORDS and len(w) >= 3]
+    if not qt:
+        return 1.0
+    text = content.lower()
+    return sum(1 for w in qt if w in text) / len(qt)
+
+
+def _rerank_filter(results: List[FetchResult], query: str) -> Tuple[List[FetchResult], dict]:
+    """F6: drop snippet-level pages clearly about a DIFFERENT meaning of the query.
+
+    Score = cosine similarity of the query embedding vs the page embedding
+    (title + first ~800 chars). A page is dropped ONLY when ALL hold:
+      - content is snippet-level (len < RERANK_MAX_LEN, i.e. below the tool's own
+        min_content_length — real fetched pages are exempt by construction),
+      - the page is missing at least one query content word (coverage < 1.0),
+      - cosine is below the absolute floor AND at least RERANK_REL_MARGIN below
+        the query's best-matching page in this batch,
+      - the page is English-like (multilingual/German pages are never dropped).
+
+    Fail-soft: model/import/embed errors -> rerank skipped, pages unchanged.
+    Returns (results, stats dict with 'rerank_dropped' and 'rerank_off').
+    """
+    stats: dict = {"rerank_dropped": 0, "rerank_off": False}
+    try:
+        if not QUALITY_FILTERS_ENABLED or not query:
+            return results, stats
+        model = _get_rerank_model()
+        if model is None:
+            stats["rerank_off"] = True
+            return results, stats
+
+        pages = [r for r in results if r.success]
+        if len(pages) < 2:
+            return results, stats
+
+        texts = [_rerank_page_text(r.content) for r in pages]
+        qv = list(model.embed([f"query: {query}"]))[0]
+        pvs = list(model.embed([f"passage: {t}" for t in texts]))
+        import numpy as np
+        sims = [float(np.dot(qv, pv)) for pv in pvs]
+        max_sim = max(sims) if sims else 0.0
+
+        drop_idx: Set[int] = set()
+        for r, sim, text in zip(pages, sims, texts):
+            content = r.content
+            if len(content) >= RERANK_MAX_LEN:
+                continue
+            if _english_ratio(text) < RERANK_MIN_EN_RATIO:
+                continue
+            if _query_coverage(query, content) >= RERANK_MIN_COVERAGE:
+                continue
+            # Ultra-short stubs (< RERANK_STRICT_LEN) drop on the absolute floor
+            # alone — the REL margin can be polluted by a near-threshold page in
+            # the same batch. Longer snippets still need to be clearly below the
+            # query's best page.
+            if sim < RERANK_MIN_SIM and (
+                len(content) < RERANK_STRICT_LEN or sim < max_sim - RERANK_REL_MARGIN
+            ):
+                drop_idx.add(id(r))
+
+        if not drop_idx:
+            return results, stats
+        stats["rerank_dropped"] = len(drop_idx)
+        return [r for r in results if id(r) not in drop_idx], stats
+    except Exception:
+        logger.debug("rerank failed; skipping")
+        stats["rerank_off"] = True
+        return results, stats
+
+
+# --- F7: recency filter -------------------------------------------------------
+
+_MONTH_NAMES = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+_RE_MONTH = re.compile(
+    r"\b(?:January|February|March|April|May|June|July|August|"
+    r"September|October|November|December)\b",
+    re.IGNORECASE,
+)
+_RE_ISO_DATE = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
+_RE_MONTH_DAY_YEAR = re.compile(
+    r"\b([A-Z][a-z]{2,8})\s+(\d{1,2}),?\s+(\d{4})\b"
+)
+_RE_DAY_MONTH_YEAR = re.compile(
+    r"\b(\d{1,2})\s+([A-Z][a-z]{2,8})\s+(\d{4})\b"
+)
+_RE_URL_DATE = re.compile(r"/(20\d{2})/(\d{1,2})/(\d{1,2})/")
+_RE_QUERY_YEAR = re.compile(r"\b(19|20)\d{2}\b")
+
+
+def _extract_page_date(content: str, url: str) -> Optional[object]:
+    """Best-effort publication date from the page content (recency filter).
+
+    Priority chain (all conservative, fail-soft): [meta] published/updated
+    lines written by the JSON-LD extractor -> visible month-name byline dates
+    near the top -> URL path /YYYY/MM/DD. Never trusts HTTP Last-Modified (CDNs
+    reset it) and never parses arbitrary YYYY-MM-DD tokens in the body (they
+    match version strings, citations, junk). Returns a datetime.date or None.
+    """
+    from datetime import datetime, timedelta, date
+    now = datetime.now()
+    head = content[:2000]
+
+    # 1. [meta] blocks produced by extract_jsonld_metadata (datePublished/dateModified).
+    #    Two emitted shapes: single-part "[meta] published: YYYY-MM-DD" (one part,
+    #    no closer) and multi-part "[meta]\npublished: ...\nupdated: ...\n[/meta]"
+    #    (parts on separate lines, closed with [/meta]). Scan each whole block so
+    #    dates on later lines are found; published keeps priority over updated.
+    #    The block boundary ([/meta] closer, or the line end for the single-part
+    #    form) keeps body-text dates from matching. They are normally prepended
+    #    at the top, but scan the whole content — the marker prefix makes false
+    #    matches in body text essentially impossible.
+    for pat in (
+        re.compile(r"\bpublished:\s*(\d{4})-(\d{1,2})-(\d{1,2})", re.IGNORECASE),
+        re.compile(r"\bupdated:\s*(\d{4})-(\d{1,2})-(\d{1,2})", re.IGNORECASE),
+    ):
+        pos = 0
+        while True:
+            s = content.find("[meta]", pos)
+            if s == -1:
+                break
+            closer = content.find("[/meta]", s)
+            if closer != -1:
+                block = content[s:closer + len("[/meta]")]
+                pos = closer + len("[/meta]")
+            else:
+                nl = content.find("\n", s)
+                block = content[s:nl if nl != -1 else len(content)]
+                pos = nl if nl != -1 else len(content)
+            m = pat.search(block)
+            if m:
+                try:
+                    d = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
+                    return d
+                except ValueError:
+                    pass
+
+    # 2. Visible byline dates near the top ("March 19, 2026", "19 March 2026")
+    m = _RE_MONTH_DAY_YEAR.search(head)
+    if m and m.group(1).lower()[:3] in {mo[:3].lower() for mo in _MONTH_NAMES}:
+        try:
+            month = next(i + 1 for i, mo in enumerate(_MONTH_NAMES) if mo.lower()[:3] == m.group(1).lower()[:3])
+            d = datetime(int(m.group(3)), month, int(m.group(2))).date()
+            return d
+        except ValueError:
+            pass
+    m = _RE_DAY_MONTH_YEAR.search(head)
+    if m and m.group(2).lower()[:3] in {mo[:3].lower() for mo in _MONTH_NAMES}:
+        try:
+            month = next(i + 1 for i, mo in enumerate(_MONTH_NAMES) if mo.lower()[:3] == m.group(2).lower()[:3])
+            d = datetime(int(m.group(3)), month, int(m.group(1))).date()
+            return d
+        except ValueError:
+            pass
+
+    # 3. URL path /YYYY/MM/DD (common on news/blog platforms)
+    m = _RE_URL_DATE.search(url)
+    if m:
+        try:
+            d = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
+            return d
+        except ValueError:
+            pass
+
+    return None
+
+
+def _is_recency_sensitive_query(query: str) -> bool:
+    """True when the query demands fresh content (recency filter applies).
+
+    Evergreen queries (history, why do, how to, explained, ethics, tutorial,
+    guide, what is...) never get recency drops. Otherwise a year in the query
+    or a time-sensitive word (news, latest, update, release, benchmark,
+    breaking changes, vs, ...) makes the query recency-sensitive.
+    """
+    q = query.lower()
+    if any(w in q for w in RECENCY_EVERGREEN_WORDS):
+        return False
+    if _RE_QUERY_YEAR.search(query):
+        return True
+    return any(w in q for w in RECENCY_SENSITIVE_WORDS)
+
+
+def _recency_filter(results: List[FetchResult], query: str) -> Tuple[List[FetchResult], dict]:
+    """F7: drop stale pages on recency-sensitive queries.
+
+    Pages with an extractable date older than RECENCY_MAX_AGE_DAYS are dropped
+    (or older than the year named in the query when the query names one).
+    Pages with NO extractable date are always kept (fail-soft: an undated page
+    cannot be proven stale). If >= 50% of the batch is undated, recency is
+    non-applicable and nothing is dropped (matches the tool's fail-soft
+    philosophy — never empty the digest on missing data).
+    Returns (results, stats dict).
+    """
+    stats: dict = {"stale_dropped": 0, "recency_skipped": False}
+    try:
+        if not QUALITY_FILTERS_ENABLED or not query:
+            return results, stats
+        if not _is_recency_sensitive_query(query):
+            return results, stats
+
+        pages = [r for r in results if r.success]
+        if len(pages) < 2:
+            return results, stats
+
+        dates = [_extract_page_date(r.content, r.url) for r in pages]
+        undated = sum(1 for d in dates if d is None)
+        if undated / len(pages) >= RECENCY_UNDATED_MAX_FRACTION:
+            stats["recency_skipped"] = True
+            return results, stats
+
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        cutoff_days = RECENCY_MAX_AGE_DAYS
+        q_year = None
+        ym = _RE_QUERY_YEAR.search(query)
+        if ym:
+            q_year = int(ym.group(0))
+
+        drop_idx: Set[int] = set()
+        for r, d in zip(pages, dates):
+            if d is None:
+                continue
+            age_days = (now.date() - d).days
+            if age_days < 0 or age_days > 60 * 365:  # clamp: future/junk dates
+                continue
+            if q_year:
+                # Older than the year named in the query — with a 1-year grace so
+                # a 2025 page on a "2026" query (fresh, months old) is never dropped.
+                stale = d.year < q_year - 1
+            else:
+                stale = age_days > cutoff_days
+            if stale:
+                drop_idx.add(id(r))
+
+        if not drop_idx:
+            return results, stats
+        stats["stale_dropped"] = len(drop_idx)
+        return [r for r in results if id(r) not in drop_idx], stats
+    except Exception:
+        logger.debug("recency filter failed; skipping")
+        return results, stats
 
 
 # =============================================================================
 # BATCH OUTPUT FORMATTERS (for non-streaming mode)
 # =============================================================================
-
-def format_batch_json(results: List[FetchResult], query: str) -> str:
-    """Format all results as JSON."""
-    successful = [r for r in results if r.success]
-    return json.dumps({
-        "query": query,
-        "stats": {
-            "urls_fetched": len(successful),
-            "content_chars": sum(len(r.content) for r in successful)
-        },
-        "content": [
-            {"url": r.url, "title": r.title, "content": r.content, "source": r.source}
-            for r in successful
-        ]
-    }, indent=2, ensure_ascii=False)
-
 
 def format_batch_raw(results: List[FetchResult]) -> str:
     """Format all results as raw text (optimized with StringIO)."""
@@ -2117,52 +3133,186 @@ def format_batch_raw(results: List[FetchResult]) -> str:
     return buffer.getvalue()
 
 
-def format_batch_markdown(results: List[FetchResult], query: str, max_preview: int = 4000) -> str:
-    """Format all results as markdown (optimized with StringIO)."""
-    successful = [r for r in results if r.success]
-    buffer = StringIO()
+# =============================================================================
+# DIGEST + REPORT FILE OUTPUT (search path)
+# =============================================================================
 
-    buffer.write(f"# Research: {query}\n\n")
-    buffer.write(f"**Sources Analyzed**: {len(successful)} pages\n\n")
-    buffer.write("---\n\n")
+def _report_root() -> Path:
+    """Repo root resolved from the script location: .opencode/tools/ -> two dirs up."""
+    return Path(__file__).resolve().parent.parent.parent
 
-    for r in successful:
-        if r.content:
-            title = r.title or r.url
-            buffer.write(f"## {title}\n")
-            buffer.write(f"*Source: {r.url}*\n\n")
-            if len(r.content) > max_preview:
-                buffer.write(r.content[:max_preview])
-                buffer.write("...")
+
+def _report_dir() -> Path:
+    """Report directory: <REPO_ROOT>/tmp/webresearch/."""
+    return _report_root() / "tmp" / REPORT_DIR_NAME
+
+
+def _query_slug(query: str) -> str:
+    """Sanitized query for the run-id: lowercase alnum, '-' separators, max ~40 chars."""
+    slug = re.sub(r"[^a-z0-9]+", "-", query.lower()).strip("-")
+    return slug[:40] or "query"
+
+
+def _make_run_id(query: str) -> str:
+    """YYYYMMDD-HHMMSS-<query-slug>-<rand4>; rand4 = random alnum for parallel-safety."""
+    rand4 = "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
+    return f"{time.strftime('%Y%m%d-%H%M%S')}-{_query_slug(query)}-{rand4}"
+
+
+def _rotate_report_files() -> None:
+    """Prune <REPO_ROOT>/tmp/webresearch/*.txt: delete files older than 7 days,
+    keep only the 30 newest regardless. Fail-soft."""
+    try:
+        report_dir = _report_dir()
+        if not report_dir.is_dir():
+            return
+        files = sorted(report_dir.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        cutoff = time.time() - REPORT_MAX_AGE_DAYS * 86400
+        fresh: List[Path] = []
+        for f in files:
+            try:
+                is_old = f.stat().st_mtime < cutoff
+            except OSError:
+                is_old = False
+            if is_old:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
             else:
-                buffer.write(r.content)
-            buffer.write("\n\n---\n\n")
+                fresh.append(f)
+        for f in fresh[REPORT_MAX_FILES:]:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    except Exception:
+        pass
 
+
+def _ensure_report_dir() -> None:
+    """mkdir the report dir at startup + rotate old files. Fail-soft."""
+    try:
+        _report_dir().mkdir(parents=True, exist_ok=True)
+        _rotate_report_files()
+    except Exception:
+        pass
+
+
+def _prepare_report_pages(results: List[FetchResult]) -> List[Tuple[FetchResult, str]]:
+    """FILTERED FULL TEXT per successful result, in final (deduped) order.
+
+    Only quality-preserving filters: F4 junk-section removal + F1 boilerplate
+    sentence removal, original order. No BM25 selection, no 10k budget cut, no
+    fact-density re-ranking — the file must be grep-safe for terms the query
+    never mentioned. Per-page safety ceiling at REPORT_PAGE_CEILING chars.
+    """
+    pages: List[Tuple[FetchResult, str]] = []
+    for r in results:
+        if not r.success:
+            continue
+        text = _filter_page_text(r.content)
+        if not text:
+            continue
+        if len(text) > REPORT_PAGE_CEILING:
+            text = text[:REPORT_PAGE_CEILING] + "\n[truncated at 200k chars]"
+        pages.append((r, text))
+    return pages
+
+
+def _build_report_file(pages: List[Tuple[FetchResult, str]]) -> str:
+    """Full report text: `=== <url> ===` + filtered text per page."""
+    buffer = StringIO()
+    for r, text in pages:
+        buffer.write(f"=== {r.url} ===\n")
+        buffer.write(text)
+        buffer.write("\n\n")
     return buffer.getvalue()
+
+
+def _human_chars(n: int) -> str:
+    """Compact char count for the digest: 14200 -> '14.2K', 900 -> '900'."""
+    if n >= 1000:
+        return f"{n / 1000:.1f}K"
+    return str(n)
+
+
+def _preview(text: str, limit: int = PREVIEW_CHARS) -> str:
+    """First ~limit chars of the filtered text, whitespace-flattened, '…' if cut."""
+    flat = RE_WHITESPACE.sub(" ", text).strip()
+    if len(flat) <= limit:
+        return flat
+    return flat[:limit].rstrip() + "…"
+
+
+def _build_digest(
+    query: str,
+    pages: List[Tuple[FetchResult, str]],
+    failures: List[FetchResult],
+    report_path: Path,
+    quality_stats: Optional[dict] = None,
+) -> str:
+    """Inline digest: stats + full-report path + per-page triage lines.
+
+    quality_stats (from F5/F6/F7) is appended to the stats line as extra
+    counters; the base format is unchanged so downstream consumers keep working.
+    """
+    total_chars = sum(len(text) for _, text in pages)
+    reasons = list(dict.fromkeys(r.error for r in failures if r.error))
+    reason_part = f" ({', '.join(reasons)})" if reasons else ""
+    quality_part = ""
+    if quality_stats:
+        qparts = []
+        if quality_stats.get("farm_dropped"):
+            qparts.append(f"farm-dropped: {quality_stats['farm_dropped']}")
+        if quality_stats.get("stub_dropped"):
+            qparts.append(f"stub-dropped: {quality_stats['stub_dropped']}")
+        if quality_stats.get("rerank_dropped"):
+            qparts.append(f"rerank-dropped: {quality_stats['rerank_dropped']}")
+        if quality_stats.get("rerank_off"):
+            qparts.append("rerank: off")
+        if quality_stats.get("stale_dropped"):
+            qparts.append(f"stale-dropped: {quality_stats['stale_dropped']}")
+        # Always visible (even at 0): pages dropped below the 50-char floor by
+        # cross-page dedup used to be completely silent; hiding the counter at
+        # 0 would recreate that silence in the common case. Appended; existing
+        # counters unchanged (backward-compatible).
+        qparts.append(f"dedup-dropped: {quality_stats.get('dedup_dropped', 0)}")
+        if qparts:
+            quality_part = " | " + " | ".join(qparts)
+    lines = [
+        f"RESEARCH: {query}",
+        f"Results: {len(pages)} fetched, {len(failures)} failed{reason_part} | {total_chars:,} chars{quality_part}",
+        f"FULL REPORT: {report_path} — grep or read this file for full content",
+    ]
+    for i, (r, text) in enumerate(pages, 1):
+        title = f" — {r.title}" if r.title else ""
+        lines.append(f"{i}. [{_human_chars(len(text))}] {r.url}{title}")
+        lines.append(f"   {_preview(text)}")
+    return "\n".join(lines)
+
+
+def _write_report_file(path: Path, content: str) -> bool:
+    """Write the report file. Returns False on failure (caller falls back to inline raw)."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return True
+    except Exception:
+        return False
 
 
 # =============================================================================
 # MAIN ENTRY POINTS
 # =============================================================================
 
-def run_research(config: ResearchConfig, verbose: bool = False) -> Optional[List[FetchResult]]:
+def run_research(config: ResearchConfig) -> Optional[List[FetchResult]]:
     """Execute research and output results."""
-    progress = ProgressReporter(quiet=config.quiet, verbose=verbose)
-
-    if config.stream:
-        # Streaming mode: output results as they arrive
-        async def stream_async():
-            try:
-                async for result in run_research_async(config, progress):
-                    if result.success:
-                        print(format_result_raw(result))
-            finally:
-                _shutdown_extract_pool()
-        asyncio.run(stream_async())
-        return None
+    progress = ProgressReporter(quiet=config.quiet)
 
     # Batch mode: collect all results, then format
     results: List[FetchResult] = []
+    _wall_t0 = time.monotonic()
 
     async def collect_async():
         try:
@@ -2170,7 +3320,26 @@ def run_research(config: ResearchConfig, verbose: bool = False) -> Optional[List
                 results.append(result)
         finally:
             _shutdown_extract_pool()
-    asyncio.run(collect_async())
+
+    # Whole-run bound for the async core on ALL platforms (Windows has no
+    # SIGALRM, so the Unix watchdog in main() does not apply there). This
+    # covers every documented unbounded vector: hung ProcessPoolExecutor
+    # extraction workers, the synchronous Scrapling fallback, and all gather
+    # points. On timeout the inner task is cancelled promptly even when a pool
+    # worker is stuck; we then os._exit(1) exactly like the SIGALRM watchdog —
+    # a plain exit could hang interpreter teardown joining the hung worker.
+    try:
+        asyncio.run(asyncio.wait_for(collect_async(), timeout=WALL_TIMEOUT))
+    except asyncio.TimeoutError:
+        log_usage({
+            "query": config.query, "mode": "search",
+            "urls_searched": 0, "urls_fetched": 0, "content_chars": 0,
+            "ok": False, "error": "wall-clock timeout",
+            "ms": int((time.monotonic() - _wall_t0) * 1000), "timeout": True,
+            "short_pages": 0, "domains": [],
+        })
+        print(f"\nwall-clock timeout ({WALL_TIMEOUT}s) — exiting", file=sys.stderr)
+        os._exit(1)  # kills child processes (ProcessPoolExecutor workers)
 
     return results
 
@@ -2186,44 +3355,19 @@ def main() -> None:
         epilog="""
 Examples:
   python web_research.py "Mac Studio M3 Ultra LLM performance"
-  python web_research.py "AI trends 2025" --fetch 50
-  python web_research.py "Python best practices" -o markdown
-  python web_research.py "query" --stream  # Stream output as results arrive
-  python web_research.py "query1" "query2" "query3"  # Parallel multi-query
   python web_research.py --url https://example.com   # Fetch specific URL (skip search)
   python web_research.py -u url1 url2 url3           # Fetch multiple URLs in parallel
 
 Search: DDG primary + Brave fallback (set BRAVE_API_KEY env var or ~/.config/brave/api_key)
 Fetch: Scrapling AsyncFetcher (TLS fingerprinting)
 Extract: trafilatura > regex > Scrapling DOM parser (tiered fallback)
-Blocked domains: facebook, youtube, tiktok, instagram, linkedin
+Blocked domains: facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.com, msn.com, forbes.com, edmunds.com, cars.com, nytimes.com, percona.com, mctlaw.com, zenodo.org, amjmed.com, dl.acm.org, nejm.org, cell.com, sciencedirect.com, onlinelibrary.wiley.com, reddit.com
         """
     )
 
     parser.add_argument("query", nargs="?", help="Search query (omit if using --url)")
-    parser.add_argument("extra_queries", nargs="*", help="Additional queries (run in parallel with first)")
     parser.add_argument("-u", "--url", nargs="+", metavar="URL",
                         help="Fetch specific URLs directly (skip search)")
-    parser.add_argument("-s", "--search", type=int, default=20,
-                        help="Number of search results (default: 20)")
-    parser.add_argument("-f", "--fetch", type=int, default=0,
-                        help="Max pages to fetch (default: 0 = fetch ALL)")
-    parser.add_argument("-m", "--max-length", type=int, default=8000,
-                        help="Max content length per page (default: 8000)")
-    parser.add_argument("-o", "--output", choices=["json", "raw", "markdown"], default="raw",
-                        help="Output format (default: raw)")
-    parser.add_argument("-t", "--timeout", type=int, default=5,
-                        help="Fetch timeout in seconds (default: 5)")
-    parser.add_argument("-c", "--concurrent", type=int, default=50,
-                        help="Max concurrent connections (default: 50)")
-    parser.add_argument("-q", "--quiet", action="store_true",
-                        help="Suppress progress messages")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Enable verbose logging")
-    parser.add_argument("--stream", action="store_true",
-                        help="Stream output as results arrive (reduces memory usage)")
-    parser.add_argument("-g", "--global-budget", type=int, default=0,
-                        help="Global char budget across all pages (0 = unlimited)")
     parser.add_argument("--usage", action="store_true",
                         help="Show usage statistics (last 30 days)")
     parser.add_argument("--sci", action="store_true",
@@ -2241,24 +3385,21 @@ Blocked domains: facebook, youtube, tiktok, instagram, linkedin
         print_usage_stats(quality=args.quality)
         sys.exit(0)
 
-    # JSON output must not have progress messages mixed in (agents parse stdout)
-    if args.output == "json":
-        args.quiet = True
-
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-
     # URL-fetch mode: skip search, just fetch specific URLs
     # Use higher default for direct fetch (user wants the full page, not search snippets)
     if args.url:
-        url_max = args.max_length if "--max-length" in sys.argv or "-m" in sys.argv else 50000
+        url_max = 50000
         async def fetch_urls():
-            progress = ProgressReporter(quiet=args.quiet, verbose=args.verbose)
+            progress = ProgressReporter()
             tasks = [
-                fetch_single_async(url, args.timeout, 100, url_max, progress=progress)
+                fetch_single_async(url, DEFAULT_TIMEOUT, 100, url_max, progress=progress)
                 for url in args.url
             ]
-            return list(await asyncio.gather(*tasks))
+            # Whole-run bound: --url shares the exact extraction vectors of
+            # search mode (hung pool worker / stuck Scrapling parse), and this
+            # branch exits before the SIGALRM watchdog below is reached, so no
+            # other wall-clock bound applies to it.
+            return list(await asyncio.wait_for(asyncio.gather(*tasks), timeout=WALL_TIMEOUT))
 
         t0 = time.monotonic()
         try:
@@ -2275,13 +3416,20 @@ Blocked domains: facebook, youtube, tiktok, instagram, linkedin
                 **_quality_fields(results),
             })
             if ok:
-                if args.output == "json":
-                    print(format_batch_json(ok, "url-fetch"))
-                else:
-                    print(format_batch_raw(ok))
+                print(format_batch_raw(ok))
             if not ok:
                 print("All URLs failed to fetch", file=sys.stderr)
                 sys.exit(1)
+        except asyncio.TimeoutError:
+            log_usage({
+                "query": "", "mode": "url-fetch",
+                "urls_searched": 0, "urls_fetched": 0,
+                "content_chars": 0, "ok": False,
+                "error": "wall-clock timeout",
+                "ms": int((time.monotonic() - t0) * 1000), "timeout": True,
+            })
+            print(f"\nwall-clock timeout ({WALL_TIMEOUT}s) — exiting", file=sys.stderr)
+            os._exit(1)  # kills child processes (ProcessPoolExecutor workers)
         except KeyboardInterrupt:
             sys.exit(130)
         sys.exit(0)
@@ -2289,145 +3437,114 @@ Blocked domains: facebook, youtube, tiktok, instagram, linkedin
     if not args.query:
         parser.error("query is required (or use --url for direct fetch)")
 
-    queries = [args.query] + (args.extra_queries or [])
+    # Prepare report dir at startup: mkdir + rotation (both fail-soft)
+    _ensure_report_dir()
+
+    queries = [args.query]
 
     def make_config(query: str) -> ResearchConfig:
         return ResearchConfig(
             query=query,
-            fetch_count=args.fetch,
-            max_content_length=args.max_length,
-            timeout=args.timeout,
-            quiet=args.quiet,
-            max_concurrent=args.concurrent,
-            search_results=args.search,
-            stream=args.stream,
             scientific=args.sci,
             medical=args.med,
             tech=args.tech,
         )
 
-    # Hard wall-clock timeout: kill the entire process after 5 minutes
+    # Hard wall-clock timeout: kill the entire process after WALL_TIMEOUT.
+    # Unix belt (SIGALRM) — bounds the WHOLE process including the
+    # post-processing phase outside run_research (quality filters, report
+    # build), which wait_for inside run_research does not cover. The wait_for
+    # bound covers the async core on ALL platforms (incl. Windows, which has
+    # no SIGALRM). Both use the same WALL_TIMEOUT value; whichever fires first
+    # on Unix produces identical behavior (message + os._exit(1)).
     import signal
     _wall_t0 = time.monotonic()
     def _timeout_handler(signum, frame):
         for q in queries:
             log_usage({
-                "query": q, "mode": "multi" if len(queries) > 1 else "search",
+                "query": q, "mode": "search",
                 "urls_searched": 0, "urls_fetched": 0, "content_chars": 0,
                 "ok": False, "error": "wall-clock timeout",
                 "ms": int((time.monotonic() - _wall_t0) * 1000), "timeout": True,
                 "short_pages": 0, "domains": [],
             })
-        print(f"\nwall-clock timeout ({_WALL_TIMEOUT}s) — exiting", file=sys.stderr)
+        print(f"\nwall-clock timeout ({WALL_TIMEOUT}s) — exiting", file=sys.stderr)
         os._exit(1)  # kills child processes (ProcessPoolExecutor workers)
-    _WALL_TIMEOUT = 300
     if hasattr(signal, 'SIGALRM'):
         signal.signal(signal.SIGALRM, _timeout_handler)
-        signal.alarm(_WALL_TIMEOUT)
+        signal.alarm(WALL_TIMEOUT)
 
     try:
-        if len(queries) == 1:
-            # Single query: original behavior
-            config = make_config(queries[0])
-            t0 = time.monotonic()
-            if args.stream:
-                run_research(config, verbose=args.verbose)
-                log_usage({
-                    "query": config.query, "mode": "search",
-                    "urls_fetched": 0, "content_chars": 0,
-                    "ok": True, "error": None,
-                    "ms": int((time.monotonic() - t0) * 1000), "timeout": False,
-                    "short_pages": 0, "domains": [],
-                })
+        # Single query: original behavior
+        config = make_config(queries[0])
+        t0 = time.monotonic()
+        results = run_research(config)
+        ok = [r for r in (results or []) if r.success]
+        # Telemetry fields are computed from the PRE-filter fetch results
+        # (unchanged semantics); only "ok" below reflects post-filter survival.
+        fetched_chars = sum(len(r.content) for r in (results or []))
+        quality_fields = _quality_fields(results)
+        pages: List[Tuple[FetchResult, str]] = []
+        failures: List[FetchResult] = []
+        if results:
+            # F5 first: page-level farm/syndication detection must see the FULL
+            # bodies (sentence dedup would gut near-identical copies and destroy
+            # the page-level Jaccard signal). Stub drop runs alongside it. Then
+            # the existing sentence dedup.
+            quality_stats: dict = {"farm_dropped": 0, "rerank_dropped": 0,
+                                   "rerank_off": False, "stale_dropped": 0,
+                                   "stub_dropped": 0, "dedup_dropped": 0}
+            if QUALITY_FILTERS_ENABLED:
+                results, stub_st = _drop_stub_pages(results)
+                quality_stats["stub_dropped"] += stub_st.get("stub_dropped", 0)
+                results, f5_st = _dedup_farm_pages(results)
+                quality_stats["farm_dropped"] += f5_st.get("farm_dropped", 0)
+            results, dedup_st = _dedup_results(results)
+            # Count pages the dedup shrank below the 50-char floor (previously
+            # only a debug log; I7: make the drop observable in the digest).
+            quality_stats["dedup_dropped"] = dedup_st.pages_dropped
+            if QUALITY_FILTERS_ENABLED:
+                results, f6_st = _rerank_filter(results, config.query)
+                results, f7_st = _recency_filter(results, config.query)
+                quality_stats.update(f6_st)
+                quality_stats.update(f7_st)
+            results, _f3_st = _dedup_cross_page_sentences(results)
+            # Digest + report-file output: the file holds the full filtered text
+            # (grep-safe), stdout carries only the compact digest. If the file
+            # cannot be written, fall back to the old inline raw output.
+            pages = _prepare_report_pages(results)
+            failures = [r for r in results if not r.success]
+        log_usage({
+            "query": config.query, "mode": "search",
+            "urls_fetched": len(ok),
+            "content_chars": fetched_chars,
+            "ok": bool(pages), "error": None,
+            "ms": int((time.monotonic() - t0) * 1000), "timeout": False,
+            **quality_fields,
+        })
+        if pages:
+            report_path = _report_dir() / f"{_make_run_id(config.query)}.txt"
+            if _write_report_file(report_path, _build_report_file(pages)):
+                print(_build_digest(config.query, pages, failures, report_path, quality_stats))
             else:
-                results = run_research(config, verbose=args.verbose)
-                ok = [r for r in (results or []) if r.success]
-                log_usage({
-                    "query": config.query, "mode": "search",
-                    "urls_fetched": len(ok),
-                    "content_chars": sum(len(r.content) for r in (results or [])),
-                    "ok": bool(results), "error": None,
-                    "ms": int((time.monotonic() - t0) * 1000), "timeout": False,
-                    **_quality_fields(results),
-                })
-                if results:
-                    results, dedup_st = _dedup_results(results)
-                    if args.global_budget > 0:
-                        results = _global_compress(results, config.query, args.global_budget)
-                    if args.output == "json":
-                        print(format_batch_json(results, config.query))
-                    elif args.output == "markdown":
-                        print(format_batch_markdown(results, config.query, config.max_content_length))
-                    else:
-                        print(format_batch_raw(results))
-                else:
-                    print("No results found", file=sys.stderr)
-                    sys.exit(1)
+                print(format_batch_raw(results))
+        elif ok:
+            # Every fetched page was dropped downstream (quality filters
+            # F5/F6/F7, stub/sentence dedup) or filtered to empty text. Exit
+            # non-zero — matching --url mode — instead of the old silent exit-0.
+            print(
+                f"No results: all {len(ok)} fetched pages were dropped by quality filters "
+                "(farm/rerank/recency/stub/dedup) or filtered to empty text",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        elif results:
+            # Every fetched page failed (fetch errors, HTTP 403, CAPTCHA...).
+            print(f"No results: all {len(results)} fetched pages failed", file=sys.stderr)
+            sys.exit(1)
         else:
-            # Multi-query: run all in parallel
-            configs = [make_config(q) for q in queries]
-            # Lower per-query concurrency to avoid resource exhaustion
-            for cfg in configs:
-                cfg.max_concurrent = min(cfg.max_concurrent, 20)
-
-            t0_multi = time.monotonic()
-
-            async def run_all():
-                seen: Set[str] = set()  # cross-query URL dedup
-                async def run_one(cfg: ResearchConfig) -> Tuple[str, List[FetchResult]]:
-                    progress = ProgressReporter(quiet=cfg.quiet, verbose=args.verbose)
-                    results: List[FetchResult] = []
-                    async for result in run_research_async(cfg, progress, global_seen_urls=seen):
-                        results.append(result)
-                    return cfg.query, results
-
-                return await asyncio.wait_for(
-                    asyncio.gather(*(run_one(c) for c in configs)),
-                    timeout=120,  # hard cap: 2 minutes for all queries
-                )
-
-            try:
-                all_results = asyncio.run(run_all())
-            except asyncio.TimeoutError:
-                elapsed = int((time.monotonic() - t0_multi) * 1000)
-                for q in queries:
-                    log_usage({
-                        "query": q, "mode": "multi",
-                        "urls_fetched": 0, "content_chars": 0,
-                        "ok": False, "error": "multi-query timeout (120s)",
-                        "ms": elapsed, "timeout": True,
-                    })
-                print("Multi-query timed out after 120s", file=sys.stderr)
-                sys.exit(1)
-
-            elapsed = int((time.monotonic() - t0_multi) * 1000)
-            dedup_seen: Set[str] = set()  # shared across queries
-            dedup_fuzzy: Set[str] = set()
-            for query, results in all_results:
-                ok = [r for r in results if r.success]
-                log_usage({
-                    "query": query, "mode": "multi",
-                    "urls_fetched": len(ok),
-                    "content_chars": sum(len(r.content) for r in results),
-                    "ok": bool(results), "error": None,
-                    "ms": elapsed, "timeout": False,
-                    **_quality_fields(results),
-                })
-                if not results:
-                    continue
-                results, _ = _dedup_results(results, seen=dedup_seen, seen_fuzzy=dedup_fuzzy)
-                if args.global_budget > 0:
-                    results = _global_compress(results, query, args.global_budget)
-                if args.output == "json":
-                    print(format_batch_json(results, query))
-                elif args.output == "markdown":
-                    print(format_batch_markdown(results, query, args.max_length))
-                else:
-                    if len(queries) > 1:
-                        print(f"\n{'='*60}")
-                        print(f"QUERY: {query}")
-                        print(f"{'='*60}\n")
-                    print(format_batch_raw(results))
+            print("No results found", file=sys.stderr)
+            sys.exit(1)
 
     except KeyboardInterrupt:
         print("\nInterrupted", file=sys.stderr)

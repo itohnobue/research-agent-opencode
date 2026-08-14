@@ -1,7 +1,7 @@
 @echo off
 REM Wrapper script for web_research.py using uv (Windows)
 
-setlocal EnableDelayedExpansion
+setlocal
 
 REM Get the directory where this script is located
 set "SCRIPT_DIR=%~dp0"
