@@ -24,8 +24,7 @@ Unified tool combining search and fetch into a single optimized workflow:
    (chromium-headless-shell; official Google build on macOS/Windows,
    bundled-libs build on Linux; uv-managed, user-cache only,
    headless/background):
-   auto by default (only when static fetch fails), --render to force,
-   --no-render to disable; the browser is auto-fetched on first use
+   auto by default (only when static fetch fails), --no-render to disable; the browser is auto-fetched on first use
    (one-time, ~100-110MB).
 7. Search mode is static-only by design (benchmarked: browser escalation in
    search cost +44% fetch time and rescued ~0-2 pages — the headless shell's
@@ -2119,26 +2118,23 @@ async def _maybe_escalate(
 ) -> FetchResult:
     """Escalation ladder: retry a static failure once with the headless browser.
 
-    Used by --url mode (auto: retry-worthy failures HTTP 403/429/5xx, CAPTCHA,
-    Timeout and Too short get a browser retry, budget-capped; force: escalates
-    everything). Search mode never calls this (static-only by design, per
-    module docstring item 7). Non-retry-worthy failures (404, DNS, PDF...)
-    return unchanged. The browser path reports its own progress (one entry);
-    the static result is reported here (once) when it wins — each URL is
-    reported exactly once where it was
+    Used by --url mode: retry-worthy failures (HTTP 403/429/5xx, CAPTCHA,
+    Timeout and Too short) get one browser retry, budget-capped. Search mode
+    never calls this (static-only by design, per module docstring item 7).
+    Non-retry-worthy failures (404, DNS, PDF...) return unchanged. The browser
+    path reports its own progress (one entry); the static result is reported
+    here (once) when it wins — each URL is reported exactly once where it was
     before the restructure. The budget check-then-increment is race-free: no
     await between the check and the `+= 1` (single-threaded event loop; the
     await for the browser fetch happens after the increment).
     """
-    if render in ("force", "auto") and _browser_available():
+    if render == "auto" and _browser_available():
         global _BROWSER_ESCALATIONS
         retry_worthy = (
-            render == "force"
-            or (not result.success and result.error in BROWSER_RETRY_ERRORS)
+            not result.success and result.error in BROWSER_RETRY_ERRORS
         )
-        if retry_worthy and (render == "force" or _BROWSER_ESCALATIONS < escalation_budget):
-            if render == "auto":
-                _BROWSER_ESCALATIONS += 1
+        if retry_worthy and _BROWSER_ESCALATIONS < escalation_budget:
+            _BROWSER_ESCALATIONS += 1
             browser_result = await _fetch_with_browser_async(
                 url, timeout, min_content_length, max_content_length, progress=progress,
             )
@@ -2161,11 +2157,11 @@ async def fetch_single_async(
 ) -> FetchResult:
     """Fetch single URL using Scrapling's AsyncFetcher (TLS fingerprinting).
 
-    render: "off" | "auto" | "force". "auto" retries failed fetches with a
-    headless-Chromium-shell render; "force" uses the browser result whenever it
-    succeeds (static path stays authoritative for PDFs and API fast-paths).
+    render: "off" | "auto". "auto" retries failed fetches with a
+    headless-Chromium-shell render (--url default); "off" is static-only
+    (--no-render / search mode).
     escalation_budget: max browser escalations per run in "auto" mode
-    (search); "force" and --url auto mode ignore the budget (single URL).
+    (single URL per --url run, so effectively 1).
     """
     # The --url full mode passes max_content_length=None (no cap). _create_fetch_result
     # would crash on `len(content) > None`, so a sentinel huge value disables
@@ -2342,9 +2338,9 @@ async def fetch_single_async(
             if wb_content:
                 result = _create_fetch_result(url, wb_content, min_content_length, max_content_length, query=query)
         # Escalation ladder: retry-worthy failures (HTTP 403/429/5xx, CAPTCHA,
-        # Timeout, Too short — and everything in "force" mode) get one retry
-        # with the headless Chromium shell, budget-capped in "auto" mode.
-        # The static result is reported once by the helper when it wins.
+        # Timeout, Too short) get one retry with the headless Chromium shell,
+        # budget-capped in "auto" mode. The static result is reported once by
+        # the helper when it wins.
         return await _maybe_escalate(
             url,
             result,
@@ -3971,11 +3967,10 @@ def main() -> None:
 Examples:
   python web_research.py "Mac Studio M3 Ultra LLM performance"
   python web_research.py --url https://example.com   # Fetch one URL: full page saved to a report file, path printed
-  python web_research.py --url https://example.com --render  # Force browser rendering for JS pages
   python web_research.py --url https://example.com --no-render  # Pure static fetch (no browser)
 
 Search: DDG primary + Brave fallback (set BRAVE_API_KEY env var or ~/.config/brave/api_key)
-Fetch: Scrapling AsyncFetcher (TLS fingerprinting); browser rendering (headless Chromium shell — chromium-headless-shell; official Google build on macOS/Windows, bundled-libs build on Linux; uv-managed, user-cache only, headless/background) for JS pages, --render to force
+Fetch: Scrapling AsyncFetcher (TLS fingerprinting); browser rendering (headless Chromium shell — chromium-headless-shell; official Google build on macOS/Windows, bundled-libs build on Linux; uv-managed, user-cache only, headless/background) auto-retries failed fetches for JS pages
 Extract: trafilatura > regex > Scrapling DOM parser (tiered fallback)
 Full page saved to tmp/webresearch/, path printed to stdout
 Blocked domains: facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.com, msn.com, forbes.com, edmunds.com, cars.com, nytimes.com, percona.com, mctlaw.com, zenodo.org, amjmed.com, dl.acm.org, nejm.org, cell.com, sciencedirect.com, onlinelibrary.wiley.com, reddit.com
@@ -3985,11 +3980,8 @@ Blocked domains: facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.
     parser.add_argument("query", nargs="?", help="Search query (omit if using --url)")
     parser.add_argument("-u", "--url", nargs="+", metavar="URL",
                         help="Fetch one URL directly: full page saved to a report file (skip search)")
-    render_group = parser.add_mutually_exclusive_group()
-    render_group.add_argument("--render", action="store_true",
-                              help="Force browser rendering (headless Chromium shell) for JS pages")
-    render_group.add_argument("--no-render", action="store_true",
-                              help="Disable browser rendering entirely (pure static path)")
+    parser.add_argument("--no-render", action="store_true",
+                        help="Disable browser rendering entirely (pure static path)")
     parser.add_argument("--usage", action="store_true",
                         help="Show usage statistics (last 30 days)")
     parser.add_argument("--sci", action="store_true",
@@ -4016,12 +4008,10 @@ Blocked domains: facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.
         url = args.url[0]
 
         # Render mode: default auto (browser only when static fetch fails);
-        # --render forces browser rendering; --no-render disables it entirely.
-        # WEB_RESEARCH_NO_BROWSER=1 overrides everything (pure static path).
+        # --no-render disables it entirely. WEB_RESEARCH_NO_BROWSER=1 overrides
+        # everything (pure static path).
         if os.environ.get("WEB_RESEARCH_NO_BROWSER") == "1":
             render_mode = "off"
-        elif args.render:
-            render_mode = "force"
         elif args.no_render:
             render_mode = "off"
         else:
