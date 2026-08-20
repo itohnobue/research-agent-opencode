@@ -13,9 +13,11 @@ Unified tool combining search and fetch into a single optimized workflow:
 3. Fetch content in parallel via Scrapling (TLS fingerprinting, anti-bot bypass)
 4. Scrapling text extraction fallback for "Too short" pages
 5. Search mode: full filtered text is written to a report file in
-   tmp/webresearch/ (run-id.txt); stdout carries a compact digest
-   (stats + FULL REPORT path + per-page previews). The model researches
-   from the report file (read/grep), not from stdout.
+   tmp/webresearch/ (run-id.txt); stdout carries a compact technical
+   index (FULL REPORT path first + stats + one line per page with
+   @line/@hit locators) — the SAME index heads the report file itself,
+   so a lost stdout digest is recoverable from the file. The model
+   researches from the report file (read/grep by @line), not from stdout.
 6. --url direct fetch: ONE URL per invocation. The full page is fetched
    (no output char cap; HTML extraction bounded by MAX_CONTENT_BYTES),
    quality-filtered, and saved to its own report file in
@@ -433,8 +435,7 @@ MIN_SCORING_POOL: int = 15
 # model researches from the file (read/grep), not from the inline output.
 
 REPORT_DIR_NAME: str = "webresearch"        # subdirectory of <REPO_ROOT>/tmp/
-PREVIEW_CHARS: int = 600                    # digest preview length per page
-REPORT_PAGE_CEILING: int = 200_000          # per-page text ceiling in the file (memory sanity, NOT the 10k budget)
+REPORT_PAGE_CEILING: int = 200_000          # per-page text ceiling in the file (memory sanity; digest is a line-per-page index, see _build_digest)
 REPORT_MAX_AGE_DAYS: int = 7                # rotation: delete files older than this
 REPORT_MAX_FILES: int = 30                  # rotation: keep only the N newest
 
@@ -3810,35 +3811,48 @@ def _ensure_report_dir() -> None:
         pass
 
 
-def _prepare_report_pages(results: List[FetchResult]) -> List[Tuple[FetchResult, str]]:
+def _prepare_report_pages(results: List[FetchResult]) -> List[Tuple[FetchResult, str, bool]]:
     """FILTERED FULL TEXT per successful result, in final (deduped) order.
 
     Only quality-preserving filters: F4 junk-section removal + F1 boilerplate
     sentence removal, original order. No BM25 selection, no 10k budget cut, no
     fact-density re-ranking — the file must be grep-safe for terms the query
     never mentioned. Per-page safety ceiling at REPORT_PAGE_CEILING chars.
+    Third tuple element = whether the text was truncated at that ceiling.
     """
-    pages: List[Tuple[FetchResult, str]] = []
+    pages: List[Tuple[FetchResult, str, bool]] = []
     for r in results:
         if not r.success:
             continue
         text = _filter_page_text(r.content)
         if not text:
             continue
-        if len(text) > REPORT_PAGE_CEILING:
+        truncated = len(text) > REPORT_PAGE_CEILING
+        if truncated:
             text = text[:REPORT_PAGE_CEILING] + "\n[truncated at 200k chars]"
-        pages.append((r, text))
+        pages.append((r, text, truncated))
     return pages
 
 
-def _build_report_file(pages: List[Tuple[FetchResult, str]]) -> str:
-    """Full report text: `=== <url> ===` + filtered text per page."""
+def _build_report_file(pages: List[Tuple[FetchResult, str, bool]]) -> Tuple[str, List[int]]:
+    """Full report text: `=== <url> ===` + filtered text per page.
+
+    Returns (content, start_lines): start_lines[i] is the 1-based line number
+    of the i-th page's `=== <url> ===` header within the returned content.
+    Line accounting must be exact — the digest's @line/@hit locators are
+    computed from these values (never by the model).
+    """
     buffer = StringIO()
-    for r, text in pages:
-        buffer.write(f"=== {r.url} ===\n")
-        buffer.write(text)
-        buffer.write("\n\n")
-    return buffer.getvalue()
+    start_lines: List[int] = []
+    line = 1
+    for r, text, _ in pages:
+        start_lines.append(line)
+        segment = f"=== {r.url} ===\n" + text + "\n\n"
+        buffer.write(segment)
+        # splitlines() counts consumed lines exactly (trailing-newline cases
+        # and empty separator lines included) — @line/@hit depend on this.
+        line += len(segment.splitlines())
+    return buffer.getvalue(), start_lines
 
 
 def _human_chars(n: int) -> str:
@@ -3848,27 +3862,65 @@ def _human_chars(n: int) -> str:
     return str(n)
 
 
-def _preview(text: str, limit: int = PREVIEW_CHARS) -> str:
-    """First ~limit chars of the filtered text, whitespace-flattened, '…' if cut."""
-    flat = RE_WHITESPACE.sub(" ", text).strip()
-    if len(flat) <= limit:
-        return flat
-    return flat[:limit].rstrip() + "…"
+QUERY_STOPWORDS = frozenset(
+    """the a an and or but for in on of to with from by at as is are was were be been
+    being do does did can could should would may might will shall not no yes so if
+    then than that this these those it its you your we our they their he she him her
+    them i me my what which who whom when where why how about into over under between
+    through during before after above below again further once here there all any both
+    each few more most other some such only own same too very just also has have had""".split()
+)
+
+
+def _query_key_terms(query: str) -> List[str]:
+    r"""Up to 2 significant query terms for @hit locators; [] when none.
+
+    `\w` (unicode-aware) keeps non-English queries working (Cyrillic/CJK);
+    the 3-char minimum skips particles, and `+`/non-word chars split tokens
+    (so "C++" yields no term by itself but "C++ pitfalls" yields "pitfalls").
+    """
+    terms: List[str] = []
+    for word in re.findall(r"\w[\w-]{2,}", query.lower()):
+        if word not in QUERY_STOPWORDS and word not in terms:
+            terms.append(word)
+        if len(terms) == 2:
+            break
+    return terms
+
+
+def _find_hit_line(text: str, terms: List[str]) -> Optional[int]:
+    """1-based line within `text` of the first line containing any key term."""
+    if not terms:
+        return None
+    for idx, line in enumerate(text.splitlines(), 1):
+        low = line.lower()
+        if any(t in low for t in terms):
+            return idx
+    return None
 
 
 def _build_digest(
     query: str,
-    pages: List[Tuple[FetchResult, str]],
+    pages: List[Tuple[FetchResult, str, bool]],
     failures: List[FetchResult],
     report_path: Path,
     quality_stats: Optional[dict] = None,
+    start_lines: Optional[List[int]] = None,
+    terms: Optional[List[str]] = None,
+    line_offset: int = 0,
 ) -> str:
-    """Inline digest: stats + full-report path + per-page triage lines.
+    """Technical index digest: FULL REPORT path FIRST and LAST, stats, one
+    technical line per page (`N. [size] [trunc] @line L @hit H — Title — URL`).
+
+    start_lines: 1-based `=== <url> ===` header lines relative to the report
+    content; line_offset: lines the digest + separator occupy at the top of the
+    final file — so @line/@hit values are absolute in the written report file.
+    The digest is small by design (~25 lines): nothing to trim.
 
     quality_stats (from F5/F6/F7) is appended to the stats line as extra
     counters; the base format is unchanged so downstream consumers keep working.
     """
-    total_chars = sum(len(text) for _, text in pages)
+    total_chars = sum(len(text) for _, text, _ in pages)
     reasons = list(dict.fromkeys(r.error for r in failures if r.error))
     reason_part = f" ({', '.join(reasons)})" if reasons else ""
     quality_part = ""
@@ -3891,16 +3943,46 @@ def _build_digest(
         qparts.append(f"dedup-dropped: {quality_stats.get('dedup_dropped', 0)}")
         if qparts:
             quality_part = " | " + " | ".join(qparts)
+    full_report_line = f"FULL REPORT: {report_path} — grep or read this file for full content"
     lines = [
+        full_report_line,
         f"RESEARCH: {query}",
-        f"Results: {len(pages)} fetched, {len(failures)} failed{reason_part} | {total_chars:,} chars{quality_part}",
-        f"FULL REPORT: {report_path} — grep or read this file for full content",
+        f"Results: {len(pages)} fetched, {len(failures)} failed{reason_part} | {total_chars:,} chars{quality_part} | ordered by relevance",
     ]
-    for i, (r, text) in enumerate(pages, 1):
-        title = f" — {r.title}" if r.title else ""
-        lines.append(f"{i}. [{_human_chars(len(text))}] {r.url}{title}")
-        lines.append(f"   {_preview(text)}")
+    for i, (r, text, truncated) in enumerate(pages, 1):
+        size = f"[{_human_chars(len(text))}{' trunc' if truncated else ''}]"
+        base = start_lines[i - 1] + line_offset if start_lines else 0
+        hit = _find_hit_line(text, terms) if terms else None
+        hit_part = f" @hit {base + hit}" if hit else ""
+        if r.title:
+            lines.append(f"{i}. {size} @line {base}{hit_part} — {r.title} — {r.url}")
+        else:
+            lines.append(f"{i}. {size} @line {base}{hit_part} — {r.url}")
+    lines.append(full_report_line)
     return "\n".join(lines)
+
+
+def _assemble_report(
+    query: str,
+    pages: List[Tuple[FetchResult, str, bool]],
+    failures: List[FetchResult],
+    report_path: Path,
+    quality_stats: Optional[dict],
+) -> Tuple[str, str]:
+    """Return (digest, report_content) for one run.
+
+    The report file = the digest (index) + a `---` separator + the page
+    content, so the artifact is self-contained: the stdout digest and the file
+    head are identical, and @line/@hit values are absolute in the final file.
+    The offset (digest lines + separator) is computed from a probe digest —
+    line COUNT does not depend on the values, so the second build is exact.
+    """
+    content, start_lines = _build_report_file(pages)
+    terms = _query_key_terms(query)
+    probe = _build_digest(query, pages, failures, report_path, quality_stats, start_lines, terms, 0)
+    offset = len(probe.splitlines()) + 1  # +1 = the `---` separator line
+    digest = _build_digest(query, pages, failures, report_path, quality_stats, start_lines, terms, offset)
+    return digest, digest + "\n---\n" + content
 
 
 def _write_report_file(path: Path, content: str) -> bool:
@@ -4146,7 +4228,7 @@ Blocked domains: facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.
         # (unchanged semantics); only "ok" below reflects post-filter survival.
         fetched_chars = sum(len(r.content) for r in (results or []))
         quality_fields = _quality_fields(results)
-        pages: List[Tuple[FetchResult, str]] = []
+        pages: List[Tuple[FetchResult, str, bool]] = []
         failures: List[FetchResult] = []
         if results:
             # F5 first: page-level farm/syndication detection must see the FULL
@@ -4186,8 +4268,12 @@ Blocked domains: facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.
         })
         if pages:
             report_path = _report_dir() / f"{_make_run_id(config.query)}.txt"
-            if _write_report_file(report_path, _build_report_file(pages)):
-                print(_build_digest(config.query, pages, failures, report_path, quality_stats))
+            digest, report_content = _assemble_report(config.query, pages, failures, report_path, quality_stats)
+            if _write_report_file(report_path, report_content):
+                print(digest)
+                # Redundant path on stderr: harnesses capture both streams, and
+                # the path must survive any stdout trimming.
+                print(f"FULL REPORT: {report_path}", file=sys.stderr)
             else:
                 print(format_batch_raw(results))
         elif ok:

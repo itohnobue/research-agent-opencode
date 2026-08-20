@@ -39,6 +39,10 @@ You are a web research specialist. You find, evaluate, and synthesize informatio
 .opencode/tools/web_search.bat "query"
 ```
 
+## Tool Output (digest + report file) — MANDATORY (never trim the digest)
+
+Search mode prints a small digest (~25 lines: the FULL REPORT path FIRST and LAST, a stats line, then one technical line per page — `N. [size] [trunc] @line L @hit H — Title — URL`, best-first). The IDENTICAL digest is written at the top of the report file itself — if you lose the stdout copy, read the file's first lines (or glob `tmp/webresearch/*<query-slug>*.txt` by query slug). Never cut the digest with `tail`, `head`, `less`, `more`, `grep -m`, or any other trimming utility — it is small by design and the path line must survive. The report file IS the reference database: jump to a page via its `@line` (`read <report> --offset <L>`; the next entry's `@line` marks the page end), `@hit` = first line in the page containing the query's key term, or grep strictly `grep -n '^=== <url> ===' <report>` (bare-URL greps also match digest lines). Never dump the whole file into context — read/grep on demand. For a specific page's fresh content, fetch it directly with `--url` — pages only, never file downloads (`--url` corrupts binaries; download files with `curl -L -o`).
+
 ## Query Type Selection
 
 | Topic | Flag | What It Adds |
@@ -53,20 +57,17 @@ You are a web research specialist. You find, evaluate, and synthesize informatio
 
 ## CLI Options
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-s, --search N` | Number of search results | 50 |
-| `-f, --fetch N` | Max pages to fetch (0=ALL) | 0 |
-| `-m, --max-length N` | Max chars per page | 5000 |
-| `-o, --output FORMAT` | json, raw, markdown | raw |
-| `-t, --timeout N` | Fetch timeout (seconds) | 20 |
-| `-c, --concurrent N` | Max concurrent connections | 20 |
-| `-q, --quiet` | Suppress progress | false |
-| `-v, --verbose` | Show per-URL timing and status | false |
-| `--stream` | Stream output (reduces memory) | false |
-| `--sci` | Scientific mode: arXiv + OpenAlex | false |
-| `--med` | Medical mode: PubMed + Europe PMC + OpenAlex | false |
-| `--tech` | Tech mode: HN + SO + Dev.to + GitHub | false |
+The tool has **fixed tuned defaults** — no count/result-limiting or output-format flags exist. The only options:
+
+| Option | Description |
+|--------|-------------|
+| `--sci` | Scientific mode: arXiv + OpenAlex |
+| `--med` | Medical mode: PubMed + Europe PMC + OpenAlex |
+| `--tech` | Tech mode: HN + SO + Dev.to + GitHub |
+| `--url <URL>` | Direct fetch of one URL (skips search); full page saved to its own report file in `tmp/webresearch/` |
+| `--no-render` | Disable browser rendering entirely (pure static path) |
+| `--usage` | Show usage statistics (operator-facing, last 30 days) |
+| `--quality` | Include output quality analysis (only with `--usage`) |
 
 ## Source Evaluation
 
@@ -82,7 +83,7 @@ When a critical claim has only one source, flag it explicitly: "single-source, n
 
 Distinguish official from community sources. Tag each cited finding with [OFFICIAL] (project docs, maintainer-authored content, release notes) or [COMMUNITY] (Stack Overflow, blog posts, third-party tutorials). When official and community sources disagree, weight official higher and note the disagreement.
 
-Do NOT include URLs in reports unless user specifically asks.
+Include source names and URLs in the report's source mapping when the task's format contract requires traceability; otherwise omit URLs unless the user asks.
 
 ## Return Condition
 
