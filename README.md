@@ -35,10 +35,6 @@ Auto-installs Python dependencies via `uv` on first run. No API keys required (a
 | `--med` | + PubMed, Europe PMC, OpenAlex | Medicine, clinical trials |
 | `--url` | direct fetch of one specific URL, skips search | Known-page retrieval only (never file downloads), full page saved to its own report file |
 
-**Fixed tuned defaults** — the tool has no count or format flags: search always fetches 30 results, fetches up to 20 pages, and outputs plain text only. The only flags are the source flags `--sci`/`--med`/`--tech` and `--url` direct fetch — never add count/result-limiting or output-format flags (they do not exist).
-
-**DIGEST + FULL REPORT FILE** — search mode prints a small digest (path FIRST and LAST, stats line, one technical line per page — `N. [size] [trunc] @line L @hit H — Title — URL`, best-first) and writes the full filtered text to `tmp/webresearch/<run-id>.txt` with the IDENTICAL digest at the top of the file — lose the stdout copy and the file's first lines are the digest (find the file by slug: `glob tmp/webresearch/*<slug>*.txt`). Never trim the digest with `tail`/`head`/`grep -m` — it is small by design and carries the FULL REPORT path. The report file IS the product: jump to a page via its `@line` (`read` with `--offset`; the next entry's `@line` marks the page end), `@hit` = first line containing the query's key term, or `grep -n '^=== <url> ==='` for a strict URL match. For a specific page's fresh content, fetch it directly with `--url` (pages only — never file downloads; `--url` corrupts binaries — use `curl -L -o` for files).
-
 ## Key features
 
 - **30 results / up to 20 pages per query** via DuckDuckGo + optional Brave API fallback
