@@ -109,7 +109,7 @@ Never return with:
 
 ## Limitations
 
-- **Blocked domains**: Reddit, Twitter, Facebook, YouTube, TikTok, Instagram, LinkedIn, Medium
-- **Filtered patterns**: /tag/, /category/, /archive/, /page/N, /shop/, /product/
+- **Blocked domains**: facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.com, msn.com, forbes.com, edmunds.com, cars.com, nytimes.com, percona.com, mctlaw.com, zenodo.org, amjmed.com, dl.acm.org, nejm.org, cell.com, sciencedirect.com, onlinelibrary.wiley.com, reddit.com (twitter.com/x.com and medium.com are unblocked — tweet text via FxTwitter, articles extract cleanly)
+- **Filtered patterns**: image extensions (.jpg/.png/.gif/.svg/.webp), /login, /signin, /signup, /cart, /checkout, /tag/, /tags/, /category/, /categories/, /archive/, /page/N, bing.com/aclick ad redirects, www.yahoo.com, finance.yahoo.com, www.aol.com (EU consent walls)
 - **CAPTCHA/blocked**: Some sites detect automated access — content will be skipped
 - **Dependencies**: Handled automatically via uv (no setup needed)

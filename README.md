@@ -45,7 +45,7 @@ Auto-installs Python dependencies via `uv` on first run. No API keys required (a
 - **Anti-bot bypass** — Scrapling with TLS fingerprinting, auto-fallback to httpx
 - **Smart extraction** — Trafilatura content-area detection (article body, not sidebars)
 - **Quality filters** — content-farm/syndication detection (F5), embedding-based rerank against homonym drift (F6), recency filtering on time-sensitive queries (F7), stub-page drop, cross-page deduplication
-- **Non-English support** — auto-detects Japanese, Chinese, Korean, Russian, Arabic, Thai and sets appropriate DDG region
+- **Non-English support** — auto-detects Japanese, Chinese, Korean and sets the appropriate DDG region
 - **Wayback Machine fallback** for paywalled pages
 - **PDF extraction** via pdftotext (poppler)
 - **Wall-clock watchdog** — hard timeout kills hung fetches on all platforms
