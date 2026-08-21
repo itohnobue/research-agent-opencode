@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["scrapling[fetchers]", "ddgs", "trafilatura", "rank-bm25", "httpx", "fastembed"]
+# dependencies = ["scrapling[fetchers]", "ddgs", "trafilatura", "rank-bm25", "httpx"]
 # ///
 # -*- coding: utf-8 -*-
 """
@@ -481,9 +481,9 @@ SECTION_DROP_HEADING_PATTERNS: Tuple[re.Pattern, ...] = (
 )
 
 # =============================================================================
-# QUALITY FILTERS F5-F7 (tunable)
+# QUALITY FILTERS F5, F7 (tunable)
 # =============================================================================
-# Three quality filters layered on top of F1-F4, tuned against the same corpus
+# Two quality filters layered on top of F1-F4, tuned against the same corpus
 # (tmp/bm25-stats/corpus.jsonl) and the motivating junk reports
 # (tmp/webresearch/20260814-*deepseek-harness*). All fail-soft: on any error the
 # filter does nothing and the pipeline keeps the unfiltered page set.
@@ -522,16 +522,6 @@ FARM_NETWORK_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(r"\b(?:free )?AI (?:Course|Community)\b", re.IGNORECASE),
 )
 
-# F6 - embedding-based semantic rerank (search path)
-RERANK_EMBEDDING_MODEL: str = "BAAI/bge-small-en-v1.5"  # fastembed default, 384-dim, MTEB ~62
-RERANK_EMBED_CHARS: int = 800               # title + first N chars of body used for the passage embedding
-RERANK_MAX_LEN: int = 600                   # only snippet-level pages (< min_content_length) are eligible for drop
-RERANK_STRICT_LEN: int = 200                # ultra-short stubs drop on absolute cosine alone (REL margin not needed)
-RERANK_MIN_SIM: float = 0.78                # absolute cosine floor — drop only clearly-below
-RERANK_REL_MARGIN: float = 0.06             # ... and at least this far below the query's best page
-RERANK_MIN_COVERAGE: float = 1.0            # page must cover ALL query content words to be safe
-RERANK_MIN_EN_RATIO: float = 0.15           # pages with less English function-word ratio are language-exempt
-
 # F7 - recency filter (search path)
 RECENCY_MAX_AGE_DAYS: int = 3 * 365         # drop pages older than this on recency-sensitive queries
 RECENCY_UNDATED_MAX_FRACTION: float = 0.5   # ≥50% undated pages → recency non-applicable (fail-soft)
@@ -545,7 +535,7 @@ RECENCY_SENSITIVE_WORDS: Tuple[str, ...] = (
     "price", "today", "announce", "2026",
 )
 
-# Master toggle: WEB_RESEARCH_QUALITY=0 disables F5-F7 entirely (search mode).
+# Master toggle: WEB_RESEARCH_QUALITY=0 disables F5/F7 entirely (search mode).
 QUALITY_FILTERS_ENABLED: bool = os.environ.get("WEB_RESEARCH_QUALITY", "1") != "0"
 
 # Stub-page rule: a page is a stub when its extracted content is small AND holds
@@ -1622,7 +1612,7 @@ def _fetch_semantic_scholar_api(paper_hash: str, max_length: int) -> Optional[st
     api_url = f"https://api.semanticscholar.org/graph/v1/paper/{paper_hash}?fields=title,abstract,authors,year,citationCount,venue"
     try:
         req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
         title = data.get("title", "Unknown")
         abstract = data.get("abstract") or ""
@@ -2235,6 +2225,10 @@ async def fetch_single_async(
             return result
         _host = urllib.parse.urlparse(url).hostname or ""
         _use_httpx = _host in _CURL_DNS_FAIL_DOMAINS
+        # Shared budget across the static attempt AND the httpx fallback: the
+        # fallback may never re-spend the full timeout (5+5=10s on DNS-failing
+        # domains). httpx gets the remainder of the original timeout, floor 1s.
+        _static_deadline = time.monotonic() + timeout
         if not _use_httpx:
             try:
                 page = await asyncio.wait_for(
@@ -2250,8 +2244,11 @@ async def fetch_single_async(
         if _use_httpx:
             # curl_cffi c-ares DNS fails for this domain — use httpx (system DNS)
             import httpx
+            # Keep the total at ~timeout+1s: scrapling may have burned the whole
+            # budget on a slow peer; httpx still gets a short window (floor 1s).
+            _remaining = max(1.0, _static_deadline - time.monotonic())
             async with httpx.AsyncClient(
-                follow_redirects=True, timeout=timeout,
+                follow_redirects=True, timeout=min(timeout, _remaining),
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
             ) as _hx:
                 _resp = await _hx.get(url)
@@ -2513,7 +2510,11 @@ class DuckDuckGoSearch:
         ddg_kwargs = {}
         if region:
             ddg_kwargs["region"] = region
-        for r in ddg.text(query, max_results=num_results * 2, **ddg_kwargs):
+        # Request exactly `num_results` (not 2x): paginating a doubled count costs
+        # ~2-3s and most extra hits are duplicates/blocked anyway — the count
+        # loop already caps the yield, and MultiSearch supplements shortfall
+        # with Brave.
+        for r in ddg.text(query, max_results=num_results, **ddg_kwargs):
             url = r.get("href", "")
             if url and url not in seen_urls and is_valid_url(url) and not is_blocked_url(url):
                 seen_urls.add(url)
@@ -2616,7 +2617,7 @@ async def run_research_async(
                 loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
                 enqueued += 1
 
-            # Supplement with DDG video + news results (bonus URLs not in web search)
+            # Supplement with topic-specific bonus sources (not in web search)
             stats.bonus_sources = {}
 
             def _enqueue_bonus(url: str, source: str = "") -> None:
@@ -2635,21 +2636,11 @@ async def run_research_async(
                 loop.call_soon_threadsafe(fetch_queue.put_nowait, url)
                 enqueued += 1
 
-            # Run bonus searches in parallel (news + topic-specific sources)
-            region = _detect_ddg_region(config.query)
-            def _bonus_news():
-                try:
-                    ddg = DDGS(verify=False)
-                    news_kwargs = {}
-                    if region:
-                        news_kwargs["region"] = region
-                    for r in ddg.news(config.query, max_results=5, **news_kwargs):
-                        url = r.get("url", "")
-                        if url:
-                            _enqueue_bonus(url, "news")
-                except Exception:
-                    pass
-
+            # Run bonus searches in parallel (topic-specific sources).
+            # NOTE: DDG is hit exactly ONCE per run (the main text search).
+            # The former DDG news bonus was removed: a second hit on the same
+            # hostname per run doubles the chance of DDG IP rate-limiting and
+            # contributed ~1 URL per run (often failing with DDGSException).
             def _bonus_arxiv():
                 """Search arXiv API, fallback to Semantic Scholar if arXiv fails."""
                 arxiv_ok = False
@@ -2666,7 +2657,7 @@ async def run_research_async(
                     encoded = urllib.parse.quote_plus(arxiv_query)
                     api_url = f"http://export.arxiv.org/api/query?search_query={encoded}&start=0&max_results=5&sortBy=relevance"
                     req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
-                    with urllib.request.urlopen(req, timeout=8) as resp:
+                    with urllib.request.urlopen(req, timeout=3) as resp:
                         xml_data = resp.read().decode("utf-8", errors="replace")
                     root = ET.fromstring(xml_data)
                     ns = {"atom": "http://www.w3.org/2005/Atom"}
@@ -2686,7 +2677,7 @@ async def run_research_async(
                         encoded = urllib.parse.quote_plus(config.query)
                         api_url = f"https://api.semanticscholar.org/graph/v1/paper/search?query={encoded}&limit=10&fields=url,externalIds"
                         req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
-                        with urllib.request.urlopen(req, timeout=8) as resp:
+                        with urllib.request.urlopen(req, timeout=3) as resp:
                             data = json.loads(resp.read().decode("utf-8", errors="replace"))
                         for paper in (data.get("data") or []):
                             ext_ids = paper.get("externalIds") or {}
@@ -2707,7 +2698,7 @@ async def run_research_async(
                     encoded = urllib.parse.quote_plus(config.query)
                     api_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={encoded}&retmax=5&retmode=json&sort=relevance"
                     req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
-                    with urllib.request.urlopen(req, timeout=8) as resp:
+                    with urllib.request.urlopen(req, timeout=3) as resp:
                         data = json.loads(resp.read().decode("utf-8", errors="replace"))
                     for pmid in (data.get("esearchresult", {}).get("idlist") or []):
                         _enqueue_bonus(f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/", "pubmed")
@@ -2721,7 +2712,7 @@ async def run_research_async(
                     encoded = urllib.parse.quote_plus(config.query)
                     api_url = f"https://api.openalex.org/works?search={encoded}&per_page=5&mailto=web-research-tool@example.com"
                     req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
-                    with urllib.request.urlopen(req, timeout=8) as resp:
+                    with urllib.request.urlopen(req, timeout=3) as resp:
                         data = json.loads(resp.read().decode("utf-8", errors="replace"))
                     for work in (data.get("results") or []):
                         # Prefer open access URL, then DOI, then landing page
@@ -2746,7 +2737,7 @@ async def run_research_async(
                     encoded = urllib.parse.quote_plus(config.query)
                     api_url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query={encoded}&format=json&pageSize=5&sort=CITED%20desc"
                     req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
-                    with urllib.request.urlopen(req, timeout=8) as resp:
+                    with urllib.request.urlopen(req, timeout=3) as resp:
                         data = json.loads(resp.read().decode("utf-8", errors="replace"))
                     for result in (data.get("resultList", {}).get("result") or []):
                         # Prefer full-text URL, then DOI, then Europe PMC page
@@ -2779,7 +2770,7 @@ async def run_research_async(
                     encoded = urllib.parse.quote_plus(hn_query)
                     api_url = f"https://hn.algolia.com/api/v1/search?query={encoded}&tags=story&hitsPerPage=5"
                     req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
-                    with urllib.request.urlopen(req, timeout=8) as resp:
+                    with urllib.request.urlopen(req, timeout=3) as resp:
                         data = json.loads(resp.read().decode("utf-8", errors="replace"))
                     for hit in (data.get("hits") or []):
                         url = hit.get("url")
@@ -2803,7 +2794,7 @@ async def run_research_async(
                         "User-Agent": "web-research-tool/1.0",
                         "Accept-Encoding": "gzip",
                     })
-                    with urllib.request.urlopen(req, timeout=8) as resp:
+                    with urllib.request.urlopen(req, timeout=3) as resp:
                         # SO API always returns gzip
                         raw = resp.read()
                         if resp.headers.get("Content-Encoding") == "gzip":
@@ -2833,7 +2824,7 @@ async def run_research_async(
                         if tag:
                             api_url += f"&tag={tag}"
                     req = urllib.request.Request(api_url, headers={"User-Agent": "web-research-tool/1.0"})
-                    with urllib.request.urlopen(req, timeout=8) as resp:
+                    with urllib.request.urlopen(req, timeout=3) as resp:
                         data = json.loads(resp.read().decode("utf-8", errors="replace"))
                     for article in (data if isinstance(data, list) else []):
                         url = article.get("url")
@@ -2852,7 +2843,7 @@ async def run_research_async(
                         "User-Agent": "web-research-tool/1.0",
                         "Accept": "application/vnd.github.v3+json",
                     })
-                    with urllib.request.urlopen(req, timeout=8) as resp:
+                    with urllib.request.urlopen(req, timeout=3) as resp:
                         data = json.loads(resp.read().decode("utf-8", errors="replace"))
                     for repo in (data.get("items") or []):
                         url = repo.get("html_url")
@@ -2861,7 +2852,7 @@ async def run_research_async(
                 except Exception:
                     pass
 
-            bonus_fns = [_bonus_news]
+            bonus_fns = []
             if config.scientific:
                 bonus_fns.extend([_bonus_arxiv, _bonus_openalex])
             if config.medical:
@@ -2870,8 +2861,9 @@ async def run_research_async(
                     bonus_fns.append(_bonus_openalex)
             if config.tech:
                 bonus_fns.extend([_bonus_hackernews, _bonus_stackoverflow, _bonus_devto, _bonus_github_repos])
-            with ThreadPoolExecutor(max_workers=len(bonus_fns)) as bonus_pool:
-                list(bonus_pool.map(lambda f: f(), bonus_fns))
+            if bonus_fns:
+                with ThreadPoolExecutor(max_workers=len(bonus_fns)) as bonus_pool:
+                    list(bonus_pool.map(lambda f: f(), bonus_fns))
 
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
@@ -3174,12 +3166,11 @@ def _dedup_cross_page_sentences(
 
 
 # =============================================================================
-# QUALITY FILTERS F5-F7 (batch path)
+# QUALITY FILTERS F5, F7 (batch path)
 # =============================================================================
 # F5: cross-domain content-farm / syndication detection (page-level).
-# F6: embedding-based semantic rerank (homonym drift).
 # F7: recency filter (stale pages on recency-sensitive queries).
-# All three are conservative, fail-soft (errors -> no filtering), and operate
+# All are conservative, fail-soft (errors -> no filtering), and operate
 # ONLY on the batch search path (never on single --url fetches).
 
 
@@ -3429,128 +3420,6 @@ def _drop_stub_pages(
         return [r for r in results if id(r) not in drop_ids], stats
     except Exception:
         logger.debug("stub filter failed; skipping")
-        return results, stats
-
-
-# --- F6: embedding rerank -----------------------------------------------------
-
-_rerank_model = None  # lazy singleton, initialized once per process
-
-
-def _get_rerank_model():
-    """Lazy singleton TextEmbedding model. Returns None on any failure (fail-soft)."""
-    global _rerank_model
-    if _rerank_model is not None:
-        return _rerank_model
-    try:
-        from fastembed import TextEmbedding
-        _rerank_model = TextEmbedding(model_name=RERANK_EMBEDDING_MODEL)
-        return _rerank_model
-    except Exception:
-        logger.debug("embedding model unavailable; rerank disabled")
-        return None
-
-
-def _rerank_page_text(content: str) -> str:
-    """Text used for the passage embedding: title (if any) + first N chars of body."""
-    title = ""
-    body = content
-    if content.startswith("# "):
-        nl = content.find("\n")
-        if nl > 0:
-            title = content[2:nl].strip()
-            idx = content.find("\n\n")
-            body = content[idx + 2:] if idx > 0 else content[nl + 1:]
-    return f"{title} {body}"[:RERANK_EMBED_CHARS].strip()
-
-
-# English function words used as a lightweight language signal (multilingual safety)
-_RERANK_EN_FUNC_WORDS = frozenset(
-    "the and of to in is that for it on with as at by this from be are was were has have had "
-    "not but they you he she we will would can could should may might more most other some such "
-    "only own very just about after before between during while because if then than too also "
-    "when where which what how who whom there here".split()
-)
-
-
-def _english_ratio(text: str) -> float:
-    """Fraction of alpha tokens that are common English function words.
-    English text typically has >0.15; German/multilingual pages are far below."""
-    words = re.findall(r"[a-zA-Z][a-zA-Z']*", text.lower())
-    if len(words) < 20:
-        return 0.5  # short snippet: cannot judge language — keep (not English-exempt)
-    return sum(1 for w in words if w in _RERANK_EN_FUNC_WORDS) / len(words)
-
-
-def _query_coverage(query: str, content: str) -> float:
-    """Fraction of query content words present in the page text (case-insensitive)."""
-    qt = [w for w in re.findall(r"[a-zA-Z0-9]+", query.lower()) if w not in _STOP_WORDS and len(w) >= 3]
-    if not qt:
-        return 1.0
-    text = content.lower()
-    return sum(1 for w in qt if w in text) / len(qt)
-
-
-def _rerank_filter(results: List[FetchResult], query: str) -> Tuple[List[FetchResult], dict]:
-    """F6: drop snippet-level pages clearly about a DIFFERENT meaning of the query.
-
-    Score = cosine similarity of the query embedding vs the page embedding
-    (title + first ~800 chars). A page is dropped ONLY when ALL hold:
-      - content is snippet-level (len < RERANK_MAX_LEN, i.e. below the tool's own
-        min_content_length — real fetched pages are exempt by construction),
-      - the page is missing at least one query content word (coverage < 1.0),
-      - cosine is below the absolute floor AND at least RERANK_REL_MARGIN below
-        the query's best-matching page in this batch,
-      - the page is English-like (multilingual/German pages are never dropped).
-
-    Fail-soft: model/import/embed errors -> rerank skipped, pages unchanged.
-    Returns (results, stats dict with 'rerank_dropped' and 'rerank_off').
-    """
-    stats: dict = {"rerank_dropped": 0, "rerank_off": False}
-    try:
-        if not QUALITY_FILTERS_ENABLED or not query:
-            return results, stats
-        model = _get_rerank_model()
-        if model is None:
-            stats["rerank_off"] = True
-            return results, stats
-
-        pages = [r for r in results if r.success]
-        if len(pages) < 2:
-            return results, stats
-
-        texts = [_rerank_page_text(r.content) for r in pages]
-        qv = list(model.embed([f"query: {query}"]))[0]
-        pvs = list(model.embed([f"passage: {t}" for t in texts]))
-        import numpy as np
-        sims = [float(np.dot(qv, pv)) for pv in pvs]
-        max_sim = max(sims) if sims else 0.0
-
-        drop_idx: Set[int] = set()
-        for r, sim, text in zip(pages, sims, texts):
-            content = r.content
-            if len(content) >= RERANK_MAX_LEN:
-                continue
-            if _english_ratio(text) < RERANK_MIN_EN_RATIO:
-                continue
-            if _query_coverage(query, content) >= RERANK_MIN_COVERAGE:
-                continue
-            # Ultra-short stubs (< RERANK_STRICT_LEN) drop on the absolute floor
-            # alone — the REL margin can be polluted by a near-threshold page in
-            # the same batch. Longer snippets still need to be clearly below the
-            # query's best page.
-            if sim < RERANK_MIN_SIM and (
-                len(content) < RERANK_STRICT_LEN or sim < max_sim - RERANK_REL_MARGIN
-            ):
-                drop_idx.add(id(r))
-
-        if not drop_idx:
-            return results, stats
-        stats["rerank_dropped"] = len(drop_idx)
-        return [r for r in results if id(r) not in drop_idx], stats
-    except Exception:
-        logger.debug("rerank failed; skipping")
-        stats["rerank_off"] = True
         return results, stats
 
 
@@ -3917,7 +3786,7 @@ def _build_digest(
     final file — so @line/@hit values are absolute in the written report file.
     The digest is small by design (~25 lines): nothing to trim.
 
-    quality_stats (from F5/F6/F7) is appended to the stats line as extra
+    quality_stats (from F5/F7) is appended to the stats line as extra
     counters; the base format is unchanged so downstream consumers keep working.
     """
     total_chars = sum(len(text) for _, text, _ in pages)
@@ -3930,10 +3799,6 @@ def _build_digest(
             qparts.append(f"farm-dropped: {quality_stats['farm_dropped']}")
         if quality_stats.get("stub_dropped"):
             qparts.append(f"stub-dropped: {quality_stats['stub_dropped']}")
-        if quality_stats.get("rerank_dropped"):
-            qparts.append(f"rerank-dropped: {quality_stats['rerank_dropped']}")
-        if quality_stats.get("rerank_off"):
-            qparts.append("rerank: off")
         if quality_stats.get("stale_dropped"):
             qparts.append(f"stale-dropped: {quality_stats['stale_dropped']}")
         # Always visible (even at 0): pages dropped below the 50-char floor by
@@ -4235,8 +4100,8 @@ Blocked domains: facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.
             # bodies (sentence dedup would gut near-identical copies and destroy
             # the page-level Jaccard signal). Stub drop runs alongside it. Then
             # the existing sentence dedup.
-            quality_stats: dict = {"farm_dropped": 0, "rerank_dropped": 0,
-                                   "rerank_off": False, "stale_dropped": 0,
+            quality_stats: dict = {"farm_dropped": 0,
+                                   "stale_dropped": 0,
                                    "stub_dropped": 0, "dedup_dropped": 0}
             if QUALITY_FILTERS_ENABLED:
                 results, stub_st = _drop_stub_pages(results)
@@ -4248,9 +4113,7 @@ Blocked domains: facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.
             # only a debug log; I7: make the drop observable in the digest).
             quality_stats["dedup_dropped"] = dedup_st.pages_dropped
             if QUALITY_FILTERS_ENABLED:
-                results, f6_st = _rerank_filter(results, config.query)
                 results, f7_st = _recency_filter(results, config.query)
-                quality_stats.update(f6_st)
                 quality_stats.update(f7_st)
             results, _f3_st = _dedup_cross_page_sentences(results)
             # Digest + report-file output: the file holds the full filtered text
@@ -4278,11 +4141,11 @@ Blocked domains: facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.
                 print(format_batch_raw(results))
         elif ok:
             # Every fetched page was dropped downstream (quality filters
-            # F5/F6/F7, stub/sentence dedup) or filtered to empty text. Exit
+            # F5/F7, stub/sentence dedup) or filtered to empty text. Exit
             # non-zero — matching --url mode — instead of the old silent exit-0.
             print(
                 f"No results: all {len(ok)} fetched pages were dropped by quality filters "
-                "(farm/rerank/recency/stub/dedup) or filtered to empty text",
+                "(farm/recency/stub/dedup) or filtered to empty text",
                 file=sys.stderr,
             )
             sys.exit(1)
