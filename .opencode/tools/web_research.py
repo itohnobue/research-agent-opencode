@@ -8,7 +8,7 @@
 Web Research Tool - Autonomous Search + Fetch + Report
 
 Unified tool combining search and fetch into a single optimized workflow:
-1. Search via DuckDuckGo + Brave (fallback) for maximum coverage
+1. Search via DuckDuckGo for maximum coverage
 2. Filter and deduplicate URLs during search (early filtering)
 3. Fetch content in parallel via Scrapling (TLS fingerprinting, anti-bot bypass)
 4. Scrapling text extraction fallback for "Too short" pages
@@ -157,9 +157,6 @@ BLOCKED_CONTENT_MARKERS: Tuple[str, ...] = (
     "distil networks",
     "blocked by",
 )
-
-# Brave Search API key: set BRAVE_API_KEY env var, or place key in ~/.config/brave/api_key
-BRAVE_API_KEY_PATH = Path(os.environ.get("BRAVE_API_KEY_FILE", str(Path.home() / ".config" / "brave" / "api_key")))
 
 # =============================================================================
 # COMPILED REGEX PATTERNS
@@ -2370,17 +2367,6 @@ async def fetch_single_async(
 # SEARCH BACKENDS
 # =============================================================================
 
-def _load_brave_api_key() -> Optional[str]:
-    """Load Brave Search API key from env var or config file."""
-    key = os.environ.get("BRAVE_API_KEY", "")
-    if key:
-        return key
-    try:
-        return BRAVE_API_KEY_PATH.read_text().strip()
-    except (FileNotFoundError, PermissionError):
-        return None
-
-
 _RE_HTML_TAGS = re.compile(r"<[^>]+>")
 
 def _snippet_relevance(query: str, title: str, snippet: str) -> float:
@@ -2395,45 +2381,6 @@ def _snippet_relevance(query: str, title: str, snippet: str) -> float:
     if not query_words:
         return 1.0
     return sum(1 for w in query_words if w in text) / len(query_words)
-
-
-class BraveSearch:
-    """Brave Search API backend."""
-
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-
-    def search(
-        self,
-        query: str,
-        num_results: int = 20,
-    ) -> Iterator[Tuple[str, str, str]]:
-        """Search Brave and yield (url, title, snippet) tuples."""
-        import urllib.request
-
-        encoded = urllib.parse.quote_plus(query)
-        url = f"https://api.search.brave.com/res/v1/web/search?q={encoded}&count={min(num_results, 20)}"
-        req = urllib.request.Request(url, headers={
-            "X-Subscription-Token": self.api_key,
-            "Accept": "application/json",
-        })
-
-        seen_urls: Set[str] = set()
-        count = 0
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="replace"))
-            for r in data.get("web", {}).get("results", []):
-                result_url = r.get("url", "")
-                if result_url and result_url not in seen_urls and is_valid_url(result_url) and not is_blocked_url(result_url):
-                    seen_urls.add(result_url)
-                    yield result_url, r.get("title", ""), r.get("description", "")
-                    count += 1
-                    if count >= num_results:
-                        return
-        except Exception as e:
-            logger.debug(f"Brave search failed: {e}")
-            return
 
 
 _ACADEMIC_STRONG = (
@@ -2512,8 +2459,7 @@ class DuckDuckGoSearch:
             ddg_kwargs["region"] = region
         # Request exactly `num_results` (not 2x): paginating a doubled count costs
         # ~2-3s and most extra hits are duplicates/blocked anyway — the count
-        # loop already caps the yield, and MultiSearch supplements shortfall
-        # with Brave.
+        # loop already caps the yield.
         for r in ddg.text(query, max_results=num_results, **ddg_kwargs):
             url = r.get("href", "")
             if url and url not in seen_urls and is_valid_url(url) and not is_blocked_url(url):
@@ -2525,44 +2471,26 @@ class DuckDuckGoSearch:
 
 
 class MultiSearch:
-    """Combined search: DDG primary, Brave fallback for coverage gaps."""
-
-    def __init__(self):
-        self._brave_key = _load_brave_api_key()
+    """DuckDuckGo search — the only search backend."""
 
     def search(
         self,
         query: str,
         num_results: int = 20,
     ) -> Iterator[Tuple[str, str, str]]:
-        """Search DDG first. If under target, supplement with Brave."""
+        """Search DuckDuckGo and yield (url, title, snippet) tuples."""
         seen_urls: Set[str] = set()
-        count = 0
         region = _detect_ddg_region(query)
 
-        # Phase 1: DuckDuckGo (primary)
         ddg = DuckDuckGoSearch()
         try:
             for url, title, snippet in ddg.search(query, num_results, region=region):
                 if url not in seen_urls:
                     seen_urls.add(url)
                     yield url, title, snippet
-                    count += 1
         except Exception as e:
             logger.debug(f"DDG search failed: {e}")
-            print(f"  DDG failed ({type(e).__name__}), trying Brave...", file=sys.stderr)
-
-        # Phase 2: Brave (supplement if DDG fell short)
-        shortfall = num_results - count
-        if shortfall > 0 and self._brave_key:
-            brave = BraveSearch(self._brave_key)
-            for url, title, snippet in brave.search(query, shortfall + 5):
-                if url not in seen_urls:
-                    seen_urls.add(url)
-                    yield url, title, snippet
-                    count += 1
-                    if count >= num_results:
-                        return
+            print(f"  DDG search failed ({type(e).__name__})", file=sys.stderr)
 
 
 # =============================================================================
@@ -2870,11 +2798,7 @@ async def run_research_async(
                 await loop.run_in_executor(executor, search_and_stream)
 
             search_elapsed = time.monotonic() - t0
-            source_info = f"{stats.urls_searched} URLs"
-            if searcher._brave_key:
-                source_info += " (DDG+Brave)"
-            else:
-                source_info += " (DDG)"
+            source_info = f"{stats.urls_searched} URLs (DDG)"
             if stats.bonus_sources:
                 bonus_parts = [f"{v} {k}" for k, v in sorted(stats.bonus_sources.items())]
                 source_info += f" + bonus: {', '.join(bonus_parts)}"
@@ -3916,7 +3840,7 @@ Examples:
   python web_research.py --url https://example.com   # Fetch one URL: full page saved to a report file, path printed
   python web_research.py --url https://example.com --no-render  # Pure static fetch (no browser)
 
-Search: DDG primary + Brave fallback (set BRAVE_API_KEY env var or ~/.config/brave/api_key)
+Search: DuckDuckGo (static, no API key)
 Fetch: Scrapling AsyncFetcher (TLS fingerprinting); browser rendering (headless Chromium shell — chromium-headless-shell; official Google build on macOS/Windows, bundled-libs build on Linux; uv-managed, user-cache only, headless/background) auto-retries failed fetches for JS pages
 Extract: trafilatura > regex > Scrapling DOM parser (tiered fallback)
 Full page saved to tmp/webresearch/, path printed to stdout

@@ -16,7 +16,7 @@ cp research-agent-opencode/AGENTS.md /path/to/your/project/
 
 If you already have an `AGENTS.md`, append this one instead of overwriting. This teaches OpenCode to route all web searches through this tool. Test it: *"Search for the most performant Rust web frameworks"*
 
-Auto-installs Python dependencies via `uv` on first run. No API keys required (an optional Brave Search API key deepens coverage).
+Auto-installs Python dependencies via `uv` on first run. No API keys required.
 
 ## Usage
 
@@ -29,7 +29,7 @@ Auto-installs Python dependencies via `uv` on first run. No API keys required (a
 
 | Flag | Sources | Best for |
 |------|---------|----------|
-| *(none)* | DuckDuckGo + Brave (if key) | General web |
+| *(none)* | DuckDuckGo | General web |
 | `--tech` | + Hacker News, Stack Overflow, Dev.to, GitHub | Software, DevOps |
 | `--sci` | + arXiv, OpenAlex | CS, physics, math, engineering |
 | `--med` | + PubMed, Europe PMC, OpenAlex | Medicine, clinical trials |
@@ -37,7 +37,7 @@ Auto-installs Python dependencies via `uv` on first run. No API keys required (a
 
 ## Key features
 
-- **30 results / up to 20 pages per query** via DuckDuckGo + optional Brave API fallback
+- **30 results / up to 20 pages per query** via DuckDuckGo
 - **Anti-bot bypass** — Scrapling with TLS fingerprinting, auto-fallback to httpx
 - **Smart extraction** — Trafilatura content-area detection (article body, not sidebars)
 - **Quality filters** — content-farm/syndication detection (F5), recency filtering on time-sensitive queries (F7), stub-page drop, cross-page deduplication
