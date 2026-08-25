@@ -29,7 +29,7 @@ Auto-installs Python dependencies via `uv` on first run. No API keys required (a
 
 | Flag | Sources | Best for |
 |------|---------|----------|
-| *(none)* | DuckDuckGo + Brave (if key) + DDG News | General web |
+| *(none)* | DuckDuckGo + Brave (if key) | General web |
 | `--tech` | + Hacker News, Stack Overflow, Dev.to, GitHub | Software, DevOps |
 | `--sci` | + arXiv, OpenAlex | CS, physics, math, engineering |
 | `--med` | + PubMed, Europe PMC, OpenAlex | Medicine, clinical trials |
@@ -46,7 +46,7 @@ Auto-installs Python dependencies via `uv` on first run. No API keys required (a
 - **PDF extraction** via pdftotext (poppler)
 - **Wall-clock watchdog** — hard timeout kills hung fetches on all platforms
 
-Full feature list and blocked/API-routed domain documentation in `AGENTS.md`.
+Full feature list and blocked/API-routed domain documentation in `.opencode/agents/web-searcher.md`.
 
 ## Requirements
 
