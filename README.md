@@ -33,7 +33,7 @@ Auto-installs Python dependencies via `uv` on first run. No API keys required.
 | `--tech` | + Hacker News, Stack Overflow, Dev.to, GitHub | Software, DevOps |
 | `--sci` | + arXiv, OpenAlex | CS, physics, math, engineering |
 | `--med` | + PubMed, Europe PMC, OpenAlex | Medicine, clinical trials |
-| `--url` | direct fetch of one specific URL, skips search | Known-page retrieval only (never file downloads), full page saved to its own report file |
+| `--url` | direct fetch of one specific URL, skips search | Known-page retrieval only (never file downloads), full page text saved raw to its own report file (no quality filters) |
 
 ## Key features
 

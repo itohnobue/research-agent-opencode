@@ -1,12 +1,13 @@
 ---
 description: Web research specialist. Single command for search + fetch + report.
 mode: subagent
+reasoningEffort: high
 tools:
   bash: true
   read: true
   grep: true
   glob: true
-  write: false
+  write: true
   edit: false
   websearch: false
   webfetch: false
@@ -71,7 +72,7 @@ The tool has **fixed tuned defaults** — no count/result-limiting or output-for
 | `--sci` | Scientific mode: arXiv + OpenAlex |
 | `--med` | Medical mode: PubMed + Europe PMC + OpenAlex |
 | `--tech` | Tech mode: HN + SO + Dev.to + GitHub |
-| `--url <URL>` | Direct fetch of one URL (skips search); full page saved to its own report file in `tmp/webresearch/` |
+| `--url <URL>` | Direct fetch of one URL (skips search, raw — no quality filters); full page text (nav/boilerplate included) saved to its own report file in `tmp/webresearch/` |
 | `--no-render` | Disable browser rendering entirely (pure static path) |
 | `--usage` | Show usage statistics (operator-facing, last 30 days) |
 | `--quality` | Include output quality analysis (only with `--usage`) |

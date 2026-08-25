@@ -19,9 +19,11 @@ Unified tool combining search and fetch into a single optimized workflow:
    so a lost stdout digest is recoverable from the file. The model
    researches from the report file (read/grep by @line), not from stdout.
 6. --url direct fetch: ONE URL per invocation. The full page is fetched
-   (no output char cap; HTML extraction bounded by MAX_CONTENT_BYTES),
-   quality-filtered, and saved to its own report file in
-   tmp/webresearch/ (run-id.txt); stdout prints ONLY the absolute path.
+   (no output char cap; HTML extraction bounded by MAX_CONTENT_BYTES) and
+   saved RAW to its own report file in tmp/webresearch/ (run-id.txt) —
+   RAW = quality filters off and full-document DOM extraction (no
+   content-area selection): every visible text node in page order,
+   nav/boilerplate included. stdout prints ONLY the absolute path.
    JS pages are rendered with a headless Chromium shell
    (chromium-headless-shell; official Google build on macOS/Windows,
    bundled-libs build on Linux; uv-managed, user-cache only,
@@ -1407,6 +1409,7 @@ def _create_fetch_result(
     min_length: int,
     max_length: int,
     query: str = "",
+    apply_filters: bool = True,
 ) -> FetchResult:
     """Create FetchResult from content, applying length checks and truncation."""
     if content and len(content) >= min_length:
@@ -1414,18 +1417,15 @@ def _create_fetch_result(
             if len(content) > max_length:
                 content = _compress_with_bm25(content, query, max_length)
         else:
-            # Direct fetch (--url): F1+F4 filters first so the cap holds
-            # cleaner content; filters never remove content that would have
-            # survived the cap (they only drop junk), fail-soft to raw.
-            content = _filter_direct_fetch(content)
+            # Direct fetch (--url): apply_filters=True runs F1+F4 first so the
+            # cap holds cleaner content (filters only drop junk, fail-soft to
+            # raw); apply_filters=False is raw mode (--url default): the page
+            # text is saved exactly as extracted, no F4/F1 cleanup.
+            if apply_filters:
+                content = _filter_direct_fetch(content)
             if len(content) > max_length:
                 content = content[:max_length] + "\n\n[Truncated...]"
-        return FetchResult(
-            url=url,
-            success=True,
-            content=content,
-            title=extract_title_from_content(content),
-        )
+        return FetchResult(url=url, success=True, content=content, title=extract_title_from_content(content))
     return FetchResult(url=url, success=False, error="Too short")
 
 
@@ -2142,6 +2142,7 @@ async def fetch_single_async(
     query: str = "",
     escalation_budget: int = 3,
     render: str = "off",
+    apply_filters: bool = True,
 ) -> FetchResult:
     """Fetch single URL using Scrapling's AsyncFetcher (TLS fingerprinting).
 
@@ -2150,6 +2151,9 @@ async def fetch_single_async(
     (--no-render / search mode).
     escalation_budget: max browser escalations per run in "auto" mode
     (single URL per --url run, so effectively 1).
+    apply_filters: False = raw mode (--url default): full-document DOM
+    extraction (no content-area detection) and no F4/F1 cleanup — every
+    visible text node in page order. True = the default filtered path.
     """
     # The --url full mode passes max_content_length=None (no cap). _create_fetch_result
     # would crash on `len(content) > None`, so a sentinel huge value disables
@@ -2210,7 +2214,7 @@ async def fetch_single_async(
         api_only = tw_match
         if api_content:
             elapsed = time.monotonic() - t0
-            result = _create_fetch_result(url, api_content, min_content_length, max_content_length, query=query)
+            result = _create_fetch_result(url, api_content, min_content_length, max_content_length, query=query, apply_filters=apply_filters)
             if progress:
                 progress.url_result(url, result.success, elapsed, result.error or "")
             return result
@@ -2295,7 +2299,7 @@ async def fetch_single_async(
                 if progress:
                     progress.url_result(url, False, elapsed, "PDF extraction failed")
                 return FetchResult(url=url, success=False, error="PDF extraction failed")
-            result = _create_fetch_result(url, content, min_content_length, max_content_length, query=query)
+            result = _create_fetch_result(url, content, min_content_length, max_content_length, query=query, apply_filters=apply_filters)
             if progress:
                 progress.url_result(url, result.success, elapsed, result.error or "")
             return result
@@ -2310,28 +2314,34 @@ async def fetch_single_async(
 
         # Extract text + JSON-LD in process pool (CPU-bound, don't block event loop)
         loop = asyncio.get_running_loop()
-        content, structured = await loop.run_in_executor(
-            _get_extract_pool(), _extract_content, raw_html
-        )
-
-        # Fallback: Scrapling's DOM parser when primary extraction is too short
-        if len(content) < min_content_length:
-            scrapling_content = _extract_with_scrapling_fallback(page, min_content_length)
-            if scrapling_content:
-                content = scrapling_content
+        if apply_filters:
+            content, structured = await loop.run_in_executor(
+                _get_extract_pool(), _extract_content, raw_html
+            )
+            # Fallback: Scrapling's DOM parser when primary extraction is too short
+            if len(content) < min_content_length:
+                scrapling_content = _extract_with_scrapling_fallback(page, min_content_length)
+                if scrapling_content:
+                    content = scrapling_content
+        else:
+            # Raw mode (--url): full-document DOM text — every visible text node
+            # in order (nav, lists, boilerplate included), no content-area
+            # detection, no F4/F1 cleanup. min_length=0 disables the gate.
+            content = _extract_with_scrapling_fallback(page, 0)
+            structured = ""
 
         # Prepend structured data to content
         if structured:
             content = structured + content
 
-        result = _create_fetch_result(url, content, min_content_length, max_content_length, query=query)
+        result = _create_fetch_result(url, content, min_content_length, max_content_length, query=query, apply_filters=apply_filters)
         # Wayback Machine fallback for failed/paywalled content
         if not result.success:
             wb_content = await loop.run_in_executor(
                 None, _fetch_wayback_fallback, url, max_content_length
             )
             if wb_content:
-                result = _create_fetch_result(url, wb_content, min_content_length, max_content_length, query=query)
+                result = _create_fetch_result(url, wb_content, min_content_length, max_content_length, query=query, apply_filters=apply_filters)
         # Escalation ladder: retry-worthy failures (HTTP 403/429/5xx, CAPTCHA,
         # Timeout, Too short) get one retry with the headless Chromium shell,
         # budget-capped in "auto" mode. The static result is reported once by
@@ -3850,7 +3860,7 @@ Blocked domains: facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.
 
     parser.add_argument("query", nargs="?", help="Search query (omit if using --url)")
     parser.add_argument("-u", "--url", nargs="+", metavar="URL",
-                        help="Fetch one URL directly: full page saved to a report file (skip search)")
+                        help="Fetch one URL directly: raw page text saved to a report file (skip search, no quality filters)")
     parser.add_argument("--no-render", action="store_true",
                         help="Disable browser rendering entirely (pure static path)")
     parser.add_argument("--usage", action="store_true",
@@ -3871,8 +3881,9 @@ Blocked domains: facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.
         sys.exit(0)
 
     # URL-fetch mode: ONE URL per invocation. Fetch the page in FULL (no char
-    # cap), apply quality filters, write the full plain text to its own report
-    # file, print ONLY the absolute path of that file to stdout.
+    # cap), save it RAW (quality filters OFF, full-document DOM text — every
+    # visible text node, nav/boilerplate included), write to its own report
+    # file, print ONLY the absolute path to stdout.
     if args.url:
         if len(args.url) > 1:
             parser.error("only one URL per invocation")
@@ -3903,6 +3914,7 @@ Blocked domains: facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.
         async def _fetch_url_single(u: str) -> FetchResult:
             return await fetch_single_async(
                 u, DEFAULT_TIMEOUT, 100, None, progress=progress, render=render_mode,
+                apply_filters=False,  # --url raw mode: page text as extracted, no F4/F1 cleanup
             )
 
         t0 = time.monotonic()
@@ -3936,9 +3948,10 @@ Blocked domains: facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.
             print(f"Failed to fetch {url}: {result.error}", file=sys.stderr)
             sys.exit(1)
 
-        # Full-page text: F4 + F1 quality filters, original order, no length cap.
-        # Fail-soft: never empties the page (<500-char guard returns original).
-        text = _filter_page_text(result.content)
+        # Raw page text: --url mode skips ALL quality filters (F4/F1 cleanup is
+        # off — the user asked for the page, not a cleaned digest). The text is
+        # exactly what extraction produced; no length cap, no fail-soft filter.
+        text = result.content
         path = _report_dir() / (_make_run_id(url) + ".txt")
         try:
             path.write_text(f"=== {url} ===\n\n{text}\n", encoding="utf-8")
