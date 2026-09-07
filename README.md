@@ -16,7 +16,7 @@ cp research-agent-opencode/AGENTS.md /path/to/your/project/
 
 If you already have an `AGENTS.md`, append this one instead of overwriting. This teaches OpenCode to route all web searches through this tool. Test it: *"Search for the most performant Rust web frameworks"*
 
-Auto-installs Python dependencies via `uv` on first run. No API keys required.
+On first run, `uv` is bootstrapped **repo-local** into `<repo>/tmp/uv/` (never system-wide — no installers touch `~/.local/bin`, `PATH`, or shell profiles) and all Python dependencies are resolved from PEP 723 inline metadata via `uv run --no-project`, so a stray `pyproject.toml` in your project can never hijack the run. No API keys required.
 
 ## Usage
 
@@ -50,7 +50,7 @@ Full feature list and blocked/API-routed domain documentation in `.opencode/agen
 
 ## Requirements
 
-- Python 3.11+ (auto-installed by `uv` if needed)
+- Python 3.11+ (managed by `uv`; downloaded into uv's cache if needed)
 - `pdftotext` (optional — from [poppler](https://poppler.freedesktop.org/), for PDF content extraction)
 
 ## License

@@ -15,4 +15,4 @@ For any internet search:
 3. Synthesize results into a report
 
 **Note**: Always use forward slashes (`/`) in paths for agent tool run, even on Windows.
-Dependencies handled automatically via uv.
+Dependencies handled automatically via uv — bootstrapped repo-local into `<repo>/tmp/uv/` on first run (never system-wide, no shell-profile edits, verified with a retry once), and every run is `uv run --no-project`, so a stray `pyproject.toml` in the project cannot hijack dependency resolution.
