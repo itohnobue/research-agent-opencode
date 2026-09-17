@@ -40,3 +40,5 @@ Thumbs.db
 tmp/
 *.tmp
 *.temp
+# CodeGraph local code index (generated per machine; methodology: docs/codegraph-methodology.md)
+.codegraph/
