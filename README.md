@@ -1,6 +1,6 @@
 # Web Search Agent
 
-Deep web search for [OpenCode](https://opencode.ai). Fetches 30 search results and up to 20 pages per query — far beyond the typical 10-20 result limit of built-in tools — and delivers a compact digest plus a full report file you can grep.
+Deep web search for [OpenCode](https://opencode.ai) (v1 & v2). Fetches 30 search results and up to 20 pages per query — far beyond the typical 10-20 result limit of built-in tools — and delivers a compact digest plus a full report file you can grep.
 
 ## Why use it
 
@@ -12,9 +12,10 @@ Most LLM search tools return 10-20 results, limiting research depth on complex q
 git clone https://github.com/itohnobue/research-agent-opencode
 cp -R research-agent-opencode/.opencode /path/to/your/project/
 cp research-agent-opencode/AGENTS.md /path/to/your/project/
+cp research-agent-opencode/opencode.json /path/to/your/project/   # skip if you already have one
 ```
 
-If you already have an `AGENTS.md`, append this one instead of overwriting. This teaches OpenCode to route all web searches through this tool. Test it: *"Search for the most performant Rust web frameworks"*
+If you already have an `AGENTS.md` or `opencode.json`, keep your own (append this AGENTS.md's instructions) instead of overwriting. This teaches OpenCode to route all web searches through this tool. Test it: *"Search for the most performant Rust web frameworks"*
 
 On first run, `uv` is bootstrapped **repo-local** into `<repo>/tmp/uv/` (never system-wide — no installers touch `~/.local/bin`, `PATH`, or shell profiles) and all Python dependencies are resolved from PEP 723 inline metadata via `uv run --no-project`, so a stray `pyproject.toml` in your project can never hijack the run. No API keys required.
 
