@@ -17,6 +17,17 @@ cp research-agent-opencode/opencode.json /path/to/your/project/   # skip if you 
 
 If you already have an `AGENTS.md` or `opencode.json`, keep your own (append this AGENTS.md's instructions) instead of overwriting. This teaches OpenCode to route all web searches through this tool. Test it: *"Search for the most performant Rust web frameworks"*
 
+## Usage
+
+| Flag | Sources | Best for |
+|------|---------|----------|
+| *(none)* | DuckDuckGo | General web |
+| `--tech` | + Hacker News, Stack Overflow, Dev.to, GitHub | Software, DevOps |
+| `--sci` | + arXiv, OpenAlex | CS, physics, math, engineering |
+| `--med` | + PubMed, Europe PMC, OpenAlex | Medicine, clinical trials |
+| `--url` | direct fetch of one specific URL, skips search | Known-page retrieval only (never file downloads), full page text saved raw to its own report file (no quality filters) |
+| `--url-chrome` | direct fetch of one URL with real Google Chrome (provisioned repo-local into `tmp/browser/chrome/`) | Pages the cheaper tiers cannot reach — JS anti-bot gates, 403 or bot-wall responses. A fallback, never a first attempt: use it only after `--url` on that same URL clearly failed, or its automatic retry already ran. `--url` escalates to it on its own; either path provisions Chrome on first use |
+
 ## Key features
 
 - **30 results / up to 20 pages per query** via DuckDuckGo
