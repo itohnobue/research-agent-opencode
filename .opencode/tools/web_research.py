@@ -24,16 +24,16 @@ Unified tool combining search and fetch into a single optimized workflow:
    RAW = quality filters off and full-document DOM extraction (no
    content-area selection): every visible text node in page order,
    nav/boilerplate included. stdout prints ONLY the absolute path.
-   JS pages are rendered with a headless Chromium shell
-   (chromium-headless-shell; official Google build on macOS/Windows,
-   bundled-libs build on Linux; uv-managed, user-cache only,
-   headless/background):
-   auto by default (only when static fetch fails), --no-render to disable; the browser is auto-fetched on first use
-   (one-time, ~100-110MB).
+   JS pages and bot-gated pages are retried with a real browser —
+   Google Chrome, driven by browser_fetch.py (the --url-chrome tier) and
+   provisioned repo-locally into tmp/browser/chrome/ on first use:
+   auto by default (only when the static fetch fails or is gated),
+   --no-render to disable. If Chrome is unavailable the static result
+   stands — a missing browser never fails the request.
 7. Search mode is static-only by design (benchmarked: browser escalation in
-   search cost +44% fetch time and rescued ~0-2 pages — the headless shell's
-   value is --url single-page JS rendering, not bulk search fetching). The
-   browser machinery (probe/install/escalation) is used ONLY by --url mode.
+   search cost +44% fetch time and rescued ~0-2 pages — the browser's value
+   is --url single-page rendering, not bulk search fetching). The browser
+   machinery (probe/install/escalation) is used ONLY by --url mode.
 
 Usage:
     python web_research.py "search query"
@@ -67,6 +67,7 @@ from io import StringIO
 from pathlib import Path
 from typing import (
     AsyncIterator,
+    Dict,
     Iterator,
     List,
     Optional,
@@ -223,113 +224,9 @@ _CURL_DNS_FAIL_DOMAINS: set = set()
 PDFTOTEXT_PATH = shutil.which("pdftotext")
 
 # ---------------------------------------------------------------------------
-# Unified browser backend: chromium-headless-shell on ALL platforms
-# (uv-managed, headless, background only; binaries in user cache dirs):
-#   - macOS / Windows: official Google build (self-contained natively),
-#     downloaded via the Chrome-for-Testing last-known-good JSON.
-#   - Linux (incl. UI-less servers): Aletherium bundled-libs build (browser +
-#     NSS/NSPR/expat libs) — the only way to run on clean hosts with no root,
-#     no apt, no system modification (loaded via LD_LIBRARY_PATH from
-#     user-writable dirs). Download ~107MB per arch, into the same cache dir.
-# ---------------------------------------------------------------------------
 _SYSTEM: str = platform.system().lower()          # "darwin" | "linux" | "windows"
 _IS_WINDOWS: bool = _SYSTEM == "windows"
 _IS_MACOS: bool = _SYSTEM == "darwin"
-_IS_LINUX: bool = _SYSTEM == "linux"
-
-
-def _shell_cache_root() -> Path:
-    """Cache root per platform (user dirs only):
-    macOS ~/Library/Caches, Linux $XDG_CACHE_HOME|~/.cache, Windows
-    %LOCALAPPDATA% — always + /webresearch/headless-shell."""
-    if _IS_WINDOWS:
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~\\AppData\\Local")
-    elif _IS_MACOS:
-        base = os.path.expanduser("~/Library/Caches")
-    else:
-        base = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
-    return Path(base) / "webresearch" / "headless-shell"
-
-
-_SHELL_CACHE_ROOT: Path = _shell_cache_root()
-
-
-def _shell_cft_platform() -> str:
-    """Chrome-for-Testing platform id (JSON `platform` key):
-    mac-arm64/mac-x64/win32/win64/linux64 from the machine."""
-    machine = platform.machine().lower()
-    if _IS_WINDOWS:
-        return "win64" if machine in ("amd64", "x86_64") else "win32"
-    if _IS_MACOS:
-        return "mac-arm64" if machine in ("arm64", "aarch64") else "mac-x64"
-    return "linux64"
-
-
-_SHELL_CFT_PLATFORM: str = _shell_cft_platform()
-
-# Linux arch id for the Aletherium release archives: amd64 | arm64
-_SHELL_ARCH: str = "arm64" if platform.machine().lower() in ("aarch64", "arm64") else "amd64"
-# Chromium version pinned by the upstream release; update together with the URL.
-_SHELL_RELEASE: str = "chromedp-148.0.7778.97"
-_SHELL_BROWSER_URL: str = (
-    "https://github.com/Aletherium/chromium-headless-shell/releases/download/"
-    f"{_SHELL_RELEASE}/chromium-headless-shell-linux-{_SHELL_ARCH}.tar.gz"
-)
-_SHELL_LIBS_URL: str = (
-    "https://github.com/Aletherium/chromium-headless-shell/releases/download/"
-    f"{_SHELL_RELEASE}/chromium-headless-shell-libs-linux-{_SHELL_ARCH}.tar.gz"
-)
-_SHELL_BROWSER_SHA_URL: str = _SHELL_BROWSER_URL + ".sha256"
-_SHELL_LIBS_SHA_URL: str = _SHELL_LIBS_URL + ".sha256"
-
-if _IS_LINUX:
-    # Linux shell cache layout: <cache>/webresearch/headless-shell/{browser,libs}
-    _SHELL_BROWSER_DIR: Path = _SHELL_CACHE_ROOT / "browser"
-    _SHELL_LIBS_DIR: Path = _SHELL_CACHE_ROOT / "libs"
-    _SHELL_EXE: Path = _SHELL_BROWSER_DIR / "headless-shell"
-else:
-    # mac/win layout: <root>/<version>/chrome-headless-shell-<platform>/
-    # chrome-headless-shell(.exe). Version = Stable channel version from the
-    # Chrome-for-Testing JSON at install time; pinned fallback below is used
-    # when the JSON cannot be fetched, and _SHELL_EXE is updated to the
-    # JSON-resolved version after a fresh install.
-    _SHELL_VERSION_FALLBACK: str = "152.0.7977.42"
-    _SHELL_EXE_NAME: str = "chrome-headless-shell.exe" if _IS_WINDOWS else "chrome-headless-shell"
-    _SHELL_BROWSER_DIR: Optional[Path] = None
-    _SHELL_LIBS_DIR: Optional[Path] = None
-
-    def _resolve_shell_exe() -> Path:
-        """Newest already-installed version in the cache, else the pinned
-        fallback path. The installer updates _SHELL_EXE after a fresh
-        download, so a later run must not re-download a JSON-resolved newer
-        version: scanning the cache at import time keeps the path stable."""
-        try:
-            if _SHELL_CACHE_ROOT.is_dir():
-                installed = [
-                    p / f"chrome-headless-shell-{_SHELL_CFT_PLATFORM}" / _SHELL_EXE_NAME
-                    for p in _SHELL_CACHE_ROOT.iterdir()
-                    if p.is_dir()
-                ]
-                installed = [p for p in installed if p.is_file()]
-                if installed:
-                    installed.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-                    return installed[0]
-        except Exception:
-            pass
-        return (
-            _SHELL_CACHE_ROOT / _SHELL_VERSION_FALLBACK
-            / f"chrome-headless-shell-{_SHELL_CFT_PLATFORM}" / _SHELL_EXE_NAME
-        )
-
-    _SHELL_EXE: Path = _resolve_shell_exe()
-
-# Browser rendering availability. Cached after the first check so the preflight
-# fetch runs at most once per run.
-_BROWSER_AVAILABLE: bool = False
-_BROWSER_CHECKED: bool = False
-
-# Cap concurrent browser fetches (safety for future parallel use; single-URL now)
-_BROWSER_SEMAPHORE_ASYNC = asyncio.Semaphore(2)
 
 # Errors worth escalating to the browser in "auto" mode. A browser cannot fix a
 # clean 404 or a DNS failure — those stay static-only (mirrors the old ladder's
@@ -1695,438 +1592,170 @@ def _fetch_wayback_fallback(url: str, max_length: int) -> Optional[str]:
     return None
 
 
-def _probe_browser_launch() -> bool:
-    """Actual launch probe — runs in a dedicated thread (never inside the
-    event loop, where asyncio.run() is illegal). Unified backend: the
-    chromium-headless-shell binary; LD_LIBRARY_PATH is set only on Linux
-    (the bundled NSS/NSPR/expat libs live in the user cache).
-
-    The version banner differs by source: the Aletherium Linux build reports
-    "Chromium ...", the official Google build reports "Google Chrome for
-    Testing ..." (verified live) — accept either token."""
-    try:
-        env = os.environ.copy()
-        if _IS_LINUX:
-            env["LD_LIBRARY_PATH"] = str(_SHELL_LIBS_DIR)
-        result = subprocess.run(
-            [
-                str(_SHELL_EXE), "--no-sandbox", "--headless", "--disable-gpu",
-                "--version",
-            ],
-            env=env,
-            capture_output=True, timeout=30,
-        )
-        return (
-            result.returncode == 0
-            and (b"Chromium" in result.stdout or b"Chrome" in result.stdout)
-        )
-    except Exception:
-        return False
+# ---------------------------------------------------------------- browser tier
+# The browser tier is real Google Chrome, driven by browser_fetch.py (--url-chrome).
+# Chromium and Chrome-for-Testing are measurably detected, so no other engine is used.
+# The tier sets itself up on first use: the wrapper provisions Chrome repo-locally
+# (tmp/browser/chrome), and it does so from whichever path needs it first — an explicit
+# --url-chrome, or the automatic --url escalation below, whose preflight runs BEFORE the
+# run's wall-clock block so a first provisioning never counts against the fetch budget.
+_BROWSER_TIER_READY: Optional[bool] = None   # None = not ensured yet this run
+_BROWSER_ENSURE_TIMEOUT: int = 900           # provisioning (download + libs) is one-time
 
 
-def _browser_available() -> bool:
-    """Cached check: can the browser backend actually launch on this system?
+def _chrome_candidates() -> List[Path]:
+    """The repo-local Chrome payload (tmp/browser/chrome) — the only browser ever used.
 
-    Existence of the binary is NOT enough — on UI-less Linux servers a browser
-    often cannot run at all (missing system libs like libX11-xcb, libnss3 too
-    old). A failed launch probe marks the browser unavailable for the whole run,
-    so search/--url escalation skips the browser instead of burning 5-10s per
-    doomed launch. Probe result cached module-wide, checked once per run; runs
-    in a thread so it is safe from sync and async call contexts alike.
+    No system install is consulted on any platform: the wrapper provisions this payload
+    (macOS .dmg, Linux .deb, Windows offline installer) so every host behaves the same.
+    The Windows payload nests chrome.exe under a versioned directory, hence the glob.
     """
-    global _BROWSER_AVAILABLE, _BROWSER_CHECKED
-    if _BROWSER_CHECKED:
-        return _BROWSER_AVAILABLE
-    _BROWSER_CHECKED = True
-    try:
-        if not _SHELL_EXE.is_file():
-            _BROWSER_AVAILABLE = False
-            return _BROWSER_AVAILABLE
-    except Exception:
-        _BROWSER_AVAILABLE = False
-        return _BROWSER_AVAILABLE
-    try:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=1) as _pool:
-            # Bounded wait: the probe subprocess has its own 30s timeout, but
-            # .result() must not block the event loop indefinitely if the
-            # thread hangs on teardown. 35s covers the 30s probe + margin.
-            _BROWSER_AVAILABLE = _pool.submit(_probe_browser_launch).result(timeout=35)
-        if not _BROWSER_AVAILABLE:
-            print(
-                "Browser present but cannot launch on this system "
-                "(missing system libraries?) — browser rendering disabled, "
-                "static fetch only",
-                file=sys.stderr,
-            )
-    except Exception:
-        _BROWSER_AVAILABLE = False
-    return _BROWSER_AVAILABLE
-
-
-def _ensure_shell_downloaded() -> bool:
-    """Download + extract the headless Chromium shell (unified backend).
-
-    Linux: Aletherium bundled-libs build (browser + libs tarballs, sha256-
-    verified). macOS/Windows: official Google build (zip resolved from the
-    Chrome-for-Testing last-known-good JSON, pinned fallback). All into the
-    user cache (same pattern as the old browser fetch: download into a
-    user-writable dir, no root, no system modification). Returns True
-    on success.
-    """
-    if _IS_LINUX:
-        return _ensure_shell_downloaded_linux()
-    return _ensure_shell_downloaded_google()
-
-
-def _verify_sha256(archive: Path, sha_url: str) -> bool:
-    """Verify a downloaded archive against its .sha256 sidecar file.
-
-    The sidecar is small (114 bytes), format "<hash>  <filename>"; compare
-    the first token to the archive's SHA-256. Fail-soft: any error (missing
-    sidecar, bad hash, network) returns False."""
-    import hashlib
-    import urllib.request
-    try:
-        req = urllib.request.Request(sha_url, headers={"User-Agent": "web-research-tool/1.0"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            sidecar = resp.read().decode("utf-8", errors="replace").strip()
-        expected = sidecar.split()[0] if sidecar else ""
-        if not expected:
-            return False
-        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-        return digest == expected
-    except Exception:
-        return False
-
-
-def _ensure_shell_downloaded_linux() -> bool:
-    """Download + extract the Aletherium bundled-libs headless-shell (Linux).
-
-    Fetches the browser and bundled-libs archives (sha256-verified) from the
-    pinned upstream release into the user cache. Returns True on success.
-    """
-    import tarfile
-    import tempfile
-    import urllib.request
-
-    def _download(url: str, dest: Path) -> bool:
+    repo = Path(__file__).resolve().parents[2]
+    root = repo / "tmp" / "browser" / "chrome"
+    if _IS_WINDOWS:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "web-research-tool/1.0"})
-            with urllib.request.urlopen(req, timeout=600) as resp, open(dest, "wb") as f:
-                shutil.copyfileobj(resp, f)
-            return True
-        except Exception:
-            return False
+            return sorted(root.glob("**/chrome.exe"),
+                          key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            return []
+    if _IS_MACOS:
+        return [root / "Google Chrome.app" / "Contents" / "MacOS" / "Google Chrome"]
+    return [root / "opt" / "google" / "chrome" / "chrome"]
 
+
+def _chrome_present() -> bool:
+    """Cheap existence check — never downloads, never launches."""
     try:
-        _SHELL_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=str(_SHELL_CACHE_ROOT)) as _tmp:
-            _tmp_dir = Path(_tmp)
-            browser_arc = _tmp_dir / "browser.tar.gz"
-            libs_arc = _tmp_dir / "libs.tar.gz"
-            if not _download(_SHELL_BROWSER_URL, browser_arc):
-                return False
-            if not _verify_sha256(browser_arc, _SHELL_BROWSER_SHA_URL):
-                return False
-            if not _download(_SHELL_LIBS_URL, libs_arc):
-                return False
-            if not _verify_sha256(libs_arc, _SHELL_LIBS_SHA_URL):
-                return False
-            browser_stage = _tmp_dir / "browser"
-            libs_stage = _tmp_dir / "libs"
-            browser_stage.mkdir()
-            libs_stage.mkdir()
-            with tarfile.open(browser_arc, "r:gz") as tf:
-                tf.extractall(str(browser_stage))
-            with tarfile.open(libs_arc, "r:gz") as tf:
-                tf.extractall(str(libs_stage))
-            # Atomically swap into place (old dirs may exist from a prior run)
-            if _SHELL_BROWSER_DIR.exists():
-                shutil.rmtree(str(_SHELL_BROWSER_DIR), ignore_errors=True)
-            if _SHELL_LIBS_DIR.exists():
-                shutil.rmtree(str(_SHELL_LIBS_DIR), ignore_errors=True)
-            shutil.move(str(browser_stage), str(_SHELL_BROWSER_DIR))
-            shutil.move(str(libs_stage), str(_SHELL_LIBS_DIR))
-        return _SHELL_EXE.is_file()
-    except Exception:
+        return any(p.exists() for p in _chrome_candidates())
+    except OSError:
         return False
 
 
-def _shell_google_download_url() -> Tuple[str, str]:
-    """Resolve (version, zip_url) for the official Google chrome-headless-shell.
+def _browser_wrapper() -> Optional[Path]:
+    """The tier's wrapper script for this platform (browser_fetch.sh / .bat)."""
+    script = Path(__file__).resolve().parent / (
+        "browser_fetch.bat" if _IS_WINDOWS else "browser_fetch.sh")
+    return script if script.exists() else None
 
-    Fetches the Chrome-for-Testing last-known-good JSON (30s timeout) and
-    picks the Stable channel's chrome-headless-shell entry for this platform.
-    On ANY failure falls back to the pinned version + known URL pattern
-    (e.g. 152.0.7977.42 for mac-arm64/mac-x64/win32/win64)."""
-    import urllib.request
-    version = _SHELL_VERSION_FALLBACK
-    url = (
-        "https://storage.googleapis.com/chrome-for-testing-public/"
-        f"{version}/{_SHELL_CFT_PLATFORM}/chrome-headless-shell-{_SHELL_CFT_PLATFORM}.zip"
-    )
+
+def _ensure_browser_tier() -> bool:
+    """Provision the Chrome tier if it is not installed yet (once per run).
+
+    Called by the --url preflight BEFORE the run's wall-clock block: a first
+    provisioning (Chrome download plus, on Linux, its system libraries) can take
+    minutes and must not count against the fetch budget. Silent and free once the
+    payload is provisioned; the wrapper is invoked only when it is missing, and the
+    wrapper is what installs it (repo-local — a system browser is never used).
+    """
+    global _BROWSER_TIER_READY
+    if _BROWSER_TIER_READY is not None:
+        return bool(_BROWSER_TIER_READY)
+    if _chrome_present():
+        _BROWSER_TIER_READY = True
+        return True
+    _BROWSER_TIER_READY = False
+    script = _browser_wrapper()
+    if script is None:
+        return False
+    print("Browser tier not installed — provisioning Google Chrome "
+          "(one-time, first use only)", file=sys.stderr)
+    env = {**os.environ, "BROWSER_FETCH_NO_FALLBACK": "1"}
     try:
-        json_url = (
-            "https://googlechromelabs.github.io/chrome-for-testing/"
-            "last-known-good-versions-with-downloads.json"
+        proc = subprocess.run(
+            [str(script), "--ensure"], capture_output=True, text=True,
+            timeout=_BROWSER_ENSURE_TIMEOUT, encoding="utf-8", errors="replace",
+            env=env,
         )
-        req = urllib.request.Request(json_url, headers={"User-Agent": "web-research-tool/1.0"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
-        downloads = data["channels"]["Stable"]["downloads"]["chrome-headless-shell"]
-        entry = next(
-            (d for d in downloads if d.get("platform") == _SHELL_CFT_PLATFORM), None
-        )
-        if entry and entry.get("url"):
-            return data["channels"]["Stable"]["version"], entry["url"]
-    except Exception:
+        for line in (proc.stderr or proc.stdout or "").splitlines():
+            if line.strip():
+                print(f"  {line.strip()}", file=sys.stderr)
+    except (OSError, subprocess.SubprocessError):
         pass
-    return version, url
+    _BROWSER_TIER_READY = _chrome_present()
+    if _BROWSER_TIER_READY:
+        print("Browser tier ready — Google Chrome provisioned in tmp/browser/chrome",
+              file=sys.stderr)
+    else:
+        print("Browser tier unavailable — the static fetch stands on its own",
+              file=sys.stderr)
+    return _BROWSER_TIER_READY
 
 
-def _ensure_shell_downloaded_google() -> bool:
-    """Download + extract the official Google chrome-headless-shell (mac/win).
+def _fetch_with_real_browser(url: str, timeout: int = 180) -> Optional[FetchResult]:
+    """Run the Chrome tier (browser_fetch.sh/.bat) as a subprocess and adopt its report.
 
-    Resolves the Stable-channel version from the Chrome-for-Testing JSON,
-    downloads the ~100MB zip into a staging dir, extracts with zipfile and
-    atomically moves it to <root>/<version>/chrome-headless-shell-<platform>/.
-    Updates the module _SHELL_EXE to the installed binary. CPython's zipfile
-    does not restore the zip entry's executable bit on extraction (verified
-    empirically on macOS), so the binary is chmod +x'd explicitly. Any
-    failure returns False (fail-soft, static fallback)."""
-    import os as _os
-    import tempfile
-    import urllib.request
-    import zipfile
-    global _SHELL_EXE
+    Returns None when the tier itself could not run (provisioning/launch failure) —
+    distinct from a page that WAS fetched but came back gated (a non-None result with
+    success=False). BROWSER_FETCH_NO_FALLBACK=1 stops the wrapper from re-running the
+    static --url fetch the caller already holds: on a tier failure it exits 3 instead.
+    """
+    script = _browser_wrapper()
+    if script is None:
+        return None
+    env = {**os.environ, "BROWSER_FETCH_NO_FALLBACK": "1"}
     try:
-        version, url = _shell_google_download_url()
-        install_dir = (
-            _SHELL_CACHE_ROOT / version
-            / f"chrome-headless-shell-{_SHELL_CFT_PLATFORM}"
-        )
-        _SHELL_EXE = install_dir / _SHELL_EXE_NAME
-        if _SHELL_EXE.is_file():
-            _os.chmod(_SHELL_EXE, 0o755)   # repair a stale non-executable extract
-            return True
-        _SHELL_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=str(_SHELL_CACHE_ROOT)) as _tmp:
-            _tmp_dir = Path(_tmp)
-            zip_path = _tmp_dir / "shell.zip"
-            req = urllib.request.Request(url, headers={"User-Agent": "web-research-tool/1.0"})
-            with urllib.request.urlopen(req, timeout=600) as resp, open(zip_path, "wb") as f:
-                shutil.copyfileobj(resp, f)
-            with zipfile.ZipFile(zip_path) as zf:
-                zf.extractall(str(_tmp_dir))
-            stage = _tmp_dir / f"chrome-headless-shell-{_SHELL_CFT_PLATFORM}"
-            if not (stage / _SHELL_EXE_NAME).is_file():
-                return False
-            # Atomically swap into place (old version dirs may exist)
-            if install_dir.exists():
-                shutil.rmtree(str(install_dir), ignore_errors=True)
-            install_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(stage), str(install_dir))
-        _os.chmod(_SHELL_EXE, 0o755)   # zipfile strips the exec bit (see docstring)
-        return _SHELL_EXE.is_file()
-    except Exception:
-        return False
-
-
-def _ensure_browser() -> None:
-    """Preflight: fetch the browser once if missing (best-effort).
-
-    Runs OUTSIDE the timed fetch block — the first download (~100-110MB
-    headless-shell) can take minutes and must not count against the
-    wall clock. On any failure prints a warning to stderr and leaves browser
-    rendering disabled (static fallback).
-    """
-    if _browser_available():
-        return
-    print("Installing headless Chromium shell (~100-110MB, one-time)...", file=sys.stderr)
-    installed = _ensure_shell_downloaded()
-    if not installed:
-        print("Browser install failed; falling back to static fetch", file=sys.stderr)
-        return
-    # Force a re-check so the cached availability reflects the new install
-    global _BROWSER_CHECKED
-    _BROWSER_CHECKED = False
-    if not _browser_available():
-        print("Browser install failed; falling back to static fetch", file=sys.stderr)
-
-
-async def _fetch_browser_page_async(
-    url: str, timeout_ms: int = 30000
-) -> Tuple[str, str, str, Optional[int]]:
-    """Unified chromium-headless-shell backend: render page.
-
-    Launches the shell via Playwright with executable_path. On Linux the
-    bundled system libraries are passed in LD_LIBRARY_PATH and --no-sandbox
-    is required (VMs/containers where unprivileged user namespaces are
-    disabled); macOS/Windows use the self-contained official build as-is.
-    Returns (html, innerText, title, status). status is the final HTTP
-    status code from goto() (None if no Response was produced — e.g. a
-    same-document navigation); network/navigation errors still raise from
-    goto() and are caught by the caller's broad except.
-    """
-    from playwright.async_api import async_playwright
-
-    async with _BROWSER_SEMAPHORE_ASYNC:
-        async with async_playwright() as _pw:
-            launch_env = None
-            if _IS_LINUX:
-                launch_env = {**os.environ, "LD_LIBRARY_PATH": str(_SHELL_LIBS_DIR)}
-            browser = await _pw.chromium.launch(
-                executable_path=str(_SHELL_EXE),
-                headless=True,
-                args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
-                env=launch_env,
-            )
-            try:
-                page = await browser.new_page()
-                resp = await page.goto(
-                    url, timeout=timeout_ms, wait_until="domcontentloaded"
-                )
-                status = resp.status if resp is not None else None
-                await page.wait_for_timeout(4000)   # SPA render settle time — MANDATORY
-                raw_html = await page.content()
-                # Capture the DOM-text fallback while the page is still alive
-                # (page methods raise after the browser context closes).
-                dom_text = await page.evaluate("document.body.innerText")
-                dom_title = await page.title()
-            finally:
-                await browser.close()
-    return raw_html, dom_text, dom_title, status
-
-
-async def _fetch_with_browser_async(
-    url: str,
-    timeout: int,
-    min_content_length: int,
-    max_content_length: int,
-    progress: Optional[ProgressReporter] = None,
-) -> FetchResult:
-    """Fetch a URL with a headless browser (JS-rendered) and build a FetchResult.
-
-    Unified backend: chromium-headless-shell (official Google build on
-    macOS/Windows; bundled-libs build on Linux incl. UI-less servers — no
-    root, no system modification, runs from user-writable dirs).
-    Mirrors the static path's guards/fallbacks (PDF, blocked content, extraction
-    with a DOM innerText fallback), but builds the FetchResult DIRECTLY —
-    un-filtered content so the caller's file path can apply its own filters.
-    HTTP >= 400 responses are gated on the returned status (goto() resolves
-    on 4xx/5xx instead of raising); network errors still surface as
-    exceptions from goto() and are caught by the broad except below.
-    """
-    t0 = time.monotonic()
+        proc = subprocess.run([str(script), url], capture_output=True, text=True,
+                              timeout=timeout, env=env,
+                              encoding="utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+    m = re.search(r"^OUTCOME:\s*(\w+)", out, re.M)
+    if m is None:
+        # No OUTCOME line: the wrapper never got as far as the browser (provisioning,
+        # uv or launch failure) — the tier is unusable, nothing was fetched.
+        return None
+    status = m.group(1)
+    path_m = re.search(r"^FULL REPORT:\s*(.+)$", out, re.M)
+    if status != "ok" or not path_m:
+        return FetchResult(url=url, success=False, error=f"browser {status}",
+                           source="chrome")
     try:
-        # Browser fetches need more time than the 5s static timeout; floor at
-        # 15s while honoring a larger configured timeout.
-        raw_html, dom_text, dom_title, status = await _fetch_browser_page_async(
-            url, timeout_ms=max(timeout, 15) * 1000
-        )
-        elapsed = time.monotonic() - t0
-
-        if status is not None and status >= 400:
-            if progress:
-                progress.url_result(url, False, elapsed, f"HTTP {status}")
-            return FetchResult(url=url, success=False, error=f"HTTP {status}")
-
-        if len(raw_html) > MAX_CONTENT_BYTES:
-            raw_html = raw_html[:MAX_CONTENT_BYTES]
-
-        if _is_pdf(raw_html, url):
-            # PDF is handled by the static path only — if the browser returned a
-            # PDF shell, give up (the static result stays authoritative).
-            if progress:
-                progress.url_result(url, False, elapsed, "PDF extraction failed")
-            return FetchResult(url=url, success=False, error="PDF extraction failed")
-
-        if is_blocked_content(raw_html):
-            if progress:
-                progress.url_result(url, False, elapsed, "CAPTCHA/blocked")
-            return FetchResult(url=url, success=False, error="CAPTCHA/blocked")
-
-        # Extract text + JSON-LD in process pool (CPU-bound, don't block event loop)
-        loop = asyncio.get_running_loop()
-        content, structured = await loop.run_in_executor(
-            _get_extract_pool(), _extract_content, raw_html
-        )
-
-        # Fallback: browser DOM innerText when primary extraction is too short.
-        # (No Scrapling Response object exists here, so the Scrapling DOM parser
-        # fallback is replaced with page.evaluate("document.body.innerText").)
-        if len(content) < min_content_length:
-            if dom_text and len(dom_text) > len(content):
-                content = dom_text
-                if dom_title:
-                    title = re.sub(r'\s*[\|\-\u2013\u2014]\s*[^|\-\u2013\u2014]{3,50}$', '', dom_title.strip())
-                    content = f"# {title}\n\n{content}"
-
-        # Prepend structured data to content
-        if structured:
-            content = structured + content
-
-        # Min-length gate (mirrors the static path's "Too short" semantics):
-        # an empty page / blank JS shell must not count as a successful fetch.
-        if len(content) < min_content_length:
-            if progress:
-                progress.url_result(url, False, elapsed, "Too short")
-            return FetchResult(url=url, success=False, error="Too short")
-
-        # Build FetchResult DIRECTLY (un-filtered): the caller applies the
-        # report-file filters, so content must not be truncated here.
-        result = FetchResult(
-            url=url,
-            success=True,
-            content=content,
-            title=extract_title_from_content(content),
-            source="browser",
-        )
-        if progress:
-            progress.url_result(url, result.success, elapsed, result.error or "")
-        return result
-    except Exception:
-        elapsed = time.monotonic() - t0
-        if progress:
-            progress.url_result(url, False, elapsed, "Browser error")
-        return FetchResult(url=url, success=False, error="Browser error")
+        raw = Path(path_m.group(1).strip()).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return FetchResult(url=url, success=False, error="browser report unreadable",
+                           source="chrome")
+    body = raw.split("\n\n", 1)[1].strip() if "\n\n" in raw else raw.strip()
+    title = next((ln[7:].strip() for ln in raw.splitlines()[:12] if ln.startswith("title: ")), "")
+    return FetchResult(url=url, success=True, content=body, title=title, source="chrome")
 
 
 async def _maybe_escalate(
     url: str,
     result: FetchResult,
-    timeout: int,
     min_content_length: int,
-    max_content_length: int,
     progress: Optional[ProgressReporter],
     render: str,
     escalation_budget: int,
     elapsed: float,
 ) -> FetchResult:
-    """Escalation ladder: retry a static failure once with the headless browser.
+    """Escalation ladder: retry a static failure once with the real browser.
 
     Used by --url mode: retry-worthy failures (HTTP 403/429/5xx, CAPTCHA,
     Timeout and Too short) get one browser retry, budget-capped. Search mode
     never calls this (static-only by design, per module docstring item 7).
     Non-retry-worthy failures (404, DNS, PDF...) return unchanged. The browser
-    path reports its own progress (one entry); the static result is reported
-    here (once) when it wins — each URL is reported exactly once where it was
-    before the restructure. The budget check-then-increment is race-free: no
+    tier is provisioned on first use by the --url preflight, which runs before the
+    wall-clock block — `_BROWSER_TIER_READY` False means that provisioning failed,
+    so there is nothing to retry with and the static result stands. The browser
+    tier is a subprocess that takes no progress argument and reports nothing to
+    this reporter — it reports through its own stderr; the static result is
+    reported here (once) when it wins. The budget check-then-increment is race-free: no
     await between the check and the `+= 1` (single-threaded event loop; the
     await for the browser fetch happens after the increment).
     """
-    if render == "auto" and _browser_available():
+    if render == "auto" and _BROWSER_TIER_READY is not False:
         global _BROWSER_ESCALATIONS
         retry_worthy = (
             not result.success and result.error in BROWSER_RETRY_ERRORS
         )
         if retry_worthy and _BROWSER_ESCALATIONS < escalation_budget:
             _BROWSER_ESCALATIONS += 1
-            browser_result = await _fetch_with_browser_async(
-                url, timeout, min_content_length, max_content_length, progress=progress,
+            browser_result = await asyncio.get_running_loop().run_in_executor(
+                None, _fetch_with_real_browser, url,
             )
-            if browser_result.success:
+            if (browser_result and browser_result.success
+                    and len(browser_result.content or "") >= min_content_length):
                 return browser_result
     if progress:
         progress.url_result(url, result.success, elapsed, result.error or "")
@@ -2146,9 +1775,9 @@ async def fetch_single_async(
 ) -> FetchResult:
     """Fetch single URL using Scrapling's AsyncFetcher (TLS fingerprinting).
 
-    render: "off" | "auto". "auto" retries failed fetches with a
-    headless-Chromium-shell render (--url default); "off" is static-only
-    (--no-render / search mode).
+    render: "off" | "auto". "auto" retries failed fetches with the real-browser
+    tier (Google Chrome, provisioned on first use by the --url preflight);
+    "off" is static-only (--no-render / search mode).
     escalation_budget: max browser escalations per run in "auto" mode
     (single URL per --url run, so effectively 1).
     apply_filters: False = raw mode (--url default): full-document DOM
@@ -2264,7 +1893,7 @@ async def fetch_single_async(
             return await _maybe_escalate(
                 url,
                 FetchResult(url=url, success=False, error=f"HTTP {page.status}"),
-                timeout, min_content_length, max_content_length,
+                min_content_length,
                 progress, render, escalation_budget, elapsed,
             )
 
@@ -2308,7 +1937,7 @@ async def fetch_single_async(
             return await _maybe_escalate(
                 url,
                 FetchResult(url=url, success=False, error="CAPTCHA/blocked"),
-                timeout, min_content_length, max_content_length,
+                min_content_length,
                 progress, render, escalation_budget, elapsed,
             )
 
@@ -2343,13 +1972,14 @@ async def fetch_single_async(
             if wb_content:
                 result = _create_fetch_result(url, wb_content, min_content_length, max_content_length, query=query, apply_filters=apply_filters)
         # Escalation ladder: retry-worthy failures (HTTP 403/429/5xx, CAPTCHA,
-        # Timeout, Too short) get one retry with the headless Chromium shell,
+        # Timeout, Too short) get one retry with real Google Chrome (the same tier
+        # as --url-chrome, provisioned on first use by the preflight above),
         # budget-capped in "auto" mode. The static result is reported once by
         # the helper when it wins.
         return await _maybe_escalate(
             url,
             result,
-            timeout, min_content_length, max_content_length,
+            min_content_length,
             progress, render, escalation_budget, elapsed,
         )
 
@@ -2358,7 +1988,7 @@ async def fetch_single_async(
         return await _maybe_escalate(
             url,
             FetchResult(url=url, success=False, error="Timeout"),
-            timeout, min_content_length, max_content_length,
+            min_content_length,
             progress, render, escalation_budget, elapsed,
         )
     except Exception as e:
@@ -2368,7 +1998,7 @@ async def fetch_single_async(
         return await _maybe_escalate(
             url,
             FetchResult(url=url, success=False, error=error_msg),
-            timeout, min_content_length, max_content_length,
+            min_content_length,
             progress, render, escalation_budget, elapsed,
         )
 
@@ -3851,7 +3481,7 @@ Examples:
   python web_research.py --url https://example.com --no-render  # Pure static fetch (no browser)
 
 Search: DuckDuckGo (static, no API key)
-Fetch: Scrapling AsyncFetcher (TLS fingerprinting); browser rendering (headless Chromium shell — chromium-headless-shell; official Google build on macOS/Windows, bundled-libs build on Linux; uv-managed, user-cache only, headless/background) auto-retries failed fetches for JS pages
+Fetch: Scrapling AsyncFetcher (TLS fingerprinting); failed or gated fetches are retried with real Google Chrome (the --url-chrome tier, provisioned into tmp/browser/chrome)
 Extract: trafilatura > regex > Scrapling DOM parser (tiered fallback)
 Full page saved to tmp/webresearch/, path printed to stdout
 Blocked domains: facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.com, msn.com, forbes.com, edmunds.com, cars.com, nytimes.com, percona.com, mctlaw.com, zenodo.org, amjmed.com, dl.acm.org, nejm.org, cell.com, sciencedirect.com, onlinelibrary.wiley.com, reddit.com
@@ -3901,12 +3531,13 @@ Blocked domains: facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.
 
         _ensure_report_dir()
 
-        # Browser preflight runs OUTSIDE the timed block: the first headless
-        # Chromium shell fetch (~100-110MB) can take minutes and must not
-        # count against the wall clock. Fetch is one-time; availability is
-        # cached.
+        # Browser-tier preflight, OUTSIDE the wall-clock block below: the tier sets
+        # itself up on first use (real Google Chrome, repo-local, like uv) — a first
+        # provisioning takes minutes and must not count against the fetch budget.
+        # No-op when the browser is disabled (--no-render / WEB_RESEARCH_NO_BROWSER=1).
         if render_mode != "off":
-            _ensure_browser()
+            _ensure_browser_tier()
+
         global _BROWSER_ESCALATIONS
         _BROWSER_ESCALATIONS = 0
         progress = ProgressReporter()
@@ -3945,7 +3576,27 @@ Blocked domains: facebook.com, tiktok.com, instagram.com, linkedin.com, youtube.
                 "ms": int((time.monotonic() - t0) * 1000), "timeout": False,
                 **_quality_fields([result]),
             })
-            print(f"Failed to fetch {url}: {result.error}", file=sys.stderr)
+            err = str(result.error)
+            print(f"Failed to fetch {url}: {err}", file=sys.stderr)
+            # Hint when the page looks bot-gated, whether or not the automatic retry
+            # covered the failure: that retry only handles BROWSER_RETRY_ERRORS, so other
+            # refusals — a WAF's own non-standard status code — deserve
+            # the pointer too. The wording depends on whether the tier actually ran: only
+            # then is repeating the page with --scroll/--wait the right advice.
+            # A clean "gone / forbidden for a reason" code is NOT bot-gating — a browser
+            # cannot fix it (see the module docs on 404/DNS): only the retry-worthy set and
+            # other refusals (a WAF's own status code) get the hint.
+            _status = re.search(r"\b[45]\d\d\b", err)
+            _clean = {"400", "404", "405", "409", "410", "422", "451"}
+            if err in BROWSER_RETRY_ERRORS or (_status and _status.group(0) not in _clean):
+                tier_ran = err in BROWSER_RETRY_ERRORS and _BROWSER_TIER_READY is True
+                if tier_ran:
+                    print(f"hint: this page looks bot-gated — the real-browser tier was "
+                          f"already tried; force it again with --scroll/--wait: "
+                          f"--url-chrome {url}", file=sys.stderr)
+                else:
+                    print(f"hint: this page looks bot-gated — retry it with a real browser: "
+                          f"--url-chrome {url}", file=sys.stderr)
             sys.exit(1)
 
         # Raw page text: --url mode skips ALL quality filters (F4/F1 cleanup is

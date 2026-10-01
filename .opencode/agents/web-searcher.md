@@ -67,9 +67,24 @@ The tool has **fixed tuned defaults** — no count/result-limiting or output-for
 | Option | Description |
 |--------|-------------|
 | `--url <URL>` | Direct fetch of one URL (skips search, raw — no quality filters); full page text (nav/boilerplate included) saved to its own report file in `tmp/webresearch/` |
-| `--no-render` | Disable browser rendering entirely (pure static path) |
+| `--url-chrome <URL>` | **Force** the real-browser fetch (Google Chrome) for that page. **Only after `--url` on that same URL clearly failed** (it exited non-zero, its `OUTCOME:` was not `ok`, or it returned a wall instead of the page) — never as a first attempt; see below. Options: `--wait N` (minimum settle; the tier keeps waiting while the page is still adding content), `--max-wait N` (cap, default 30), `--scroll`, `--screenshot` |
+| `--no-render` | Disable automatic browser retry entirely (pure static path) |
 | `--usage` | Show usage statistics (operator-facing, last 30 days) |
 | `--quality` | Include output quality analysis (only with `--usage`) |
+
+### When to force `--url-chrome`
+
+The tool retries a page with Chrome on its own only for failures it can *recognise*: HTTP 403/429/5xx, a CAPTCHA/blocked marker, a timeout, or content that came back too short. It cannot tell that a fetch **succeeded and returned a wall instead of the page** — that judgement is yours, and it is the reason the explicit `--url-chrome` flag exists.
+
+**Never reach for `--url-chrome` first.** Fetch the page with `--url` (the cheap static path) and use `--url-chrome` only once that request has clearly failed — it exited non-zero, its `OUTCOME:` was not `ok`, or it returned a wall instead of the page. Then look at what `--url` actually returned and re-fetch **that same URL** (do not re-search) with `--url-chrome <url>` when the text looks like:
+
+- a **JavaScript / consent / sign-in wall** — "enable JavaScript", cookie or age gates, "log in to continue", "sign up to read";
+- **boilerplate only** — menus, footers, legal text, no article body;
+- **skeleton or placeholder text** — "Loading…", "Please wait", template braces, spinner captions;
+- **structure without data** — a product page with no price, a table with only headers, a list with no items;
+- **too short or cut off** for the page type (a long article that ends mid-sentence).
+
+Add `--scroll` for list and marketplace pages; reach for `--wait N` / `--max-wait N` only when a page needs more settling than the adaptive default gives it. Read the `OUTCOME:` line in the result — `ok` / `blocked` / `error`, decided from the HTTP status and the body size rather than wording (a refusal status with a short body is `blocked`; a long body is content whatever the status claims; no text at all, or a short body with any other >=400, is `error`; a wall served with HTTP 200 looks like content to the tool, so judge that one from the text yourself); a timeout or launch failure writes no report and exits 2, or 3 when the tier could not run — on anything but `ok` the page did not come back, so never answer from it. The browser is slow (one real Chrome launch per invocation, reused across that invocation's URLs), so force it deliberately for the pages you actually need — never as the default path.
 
 ## Source Evaluation
 

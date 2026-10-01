@@ -11,6 +11,17 @@ set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
 REM Repo root (script lives in .opencode/tools, so two levels up)
 for %%I in ("%SCRIPT_DIR%\..\..") do set "REPO_ROOT=%%~fI"
 
+REM Real-browser tier: --url-chrome is handled by browser_fetch.bat (its own deps + payload),
+REM so playwright never enters the ordinary search path.
+REM NOTE: the exit code must be returned OUTSIDE a parenthesised block — cmd expands
+REM %ERRORLEVEL% when it parses a block, which would return a stale value.
+echo %* | findstr /C:"--url-chrome" >nul 2>nul
+if errorlevel 1 goto :search
+call "%SCRIPT_DIR%\browser_fetch.bat" %*
+exit /b %ERRORLEVEL%
+
+:search
+
 REM Local uv install (tool-use policy R3): repo-local, never system-wide
 set "UV_DIR=%REPO_ROOT%\tmp\uv"
 set "UV_OK=0"

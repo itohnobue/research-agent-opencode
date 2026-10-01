@@ -3,6 +3,14 @@
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
+# Real-browser tier: --url-chrome is handled by browser_fetch.sh (its own deps + payload),
+# so playwright never enters the ordinary search path.
+for arg in "$@"; do
+    if [ "$arg" = "--url-chrome" ]; then
+        exec "$SCRIPT_DIR/browser_fetch.sh" "$@"
+    fi
+done
+
 # Local uv install (tool-use policy R3): repo-local, never system-wide
 REPO_ROOT="$( cd "$SCRIPT_DIR/../../" && pwd )"
 UV_DIR="$REPO_ROOT/tmp/uv"
