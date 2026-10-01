@@ -17,27 +17,6 @@ cp research-agent-opencode/opencode.json /path/to/your/project/   # skip if you 
 
 If you already have an `AGENTS.md` or `opencode.json`, keep your own (append this AGENTS.md's instructions) instead of overwriting. This teaches OpenCode to route all web searches through this tool. Test it: *"Search for the most performant Rust web frameworks"*
 
-On first run, `uv` is bootstrapped **repo-local** into `<repo>/tmp/uv/` (never system-wide — no installers touch `~/.local/bin`, `PATH`, or shell profiles) and all Python dependencies are resolved from PEP 723 inline metadata via `uv run --no-project`, so a stray `pyproject.toml` in your project can never hijack the run. No API keys required. The `--url-chrome` tier keeps real Google Chrome plus the browser profile in `<repo>/tmp/browser/` (provisioned on first use — by an explicit `--url-chrome`, or by the `--url` preflight before its fetch, exactly like uv — it is the only browser engine used, never a system install; if Chrome cannot be provisioned, the request falls back to the ordinary static `--url` fetch).
-
-## Usage
-
-```bash
-.opencode/tools/web_search.sh "React server components best practices" --tech
-.opencode/tools/web_search.sh "CRISPR delivery methods" --sci --med
-.opencode/tools/web_search.sh "Kalman filter implementations" --sci
-.opencode/tools/web_search.sh --url https://example.com   # direct page fetch (pages only — never file downloads; use curl -L -o for files)
-.opencode/tools/web_search.sh --url-chrome "https://www.ozon.ru/search/?text=macbook"   # real-browser fetch — ONLY after --url on that same URL failed or returned a wall; provisions Google Chrome into tmp/browser on first use
-```
-
-| Flag | Sources | Best for |
-|------|---------|----------|
-| *(none)* | DuckDuckGo | General web |
-| `--tech` | + Hacker News, Stack Overflow, Dev.to, GitHub | Software, DevOps |
-| `--sci` | + arXiv, OpenAlex | CS, physics, math, engineering |
-| `--med` | + PubMed, Europe PMC, OpenAlex | Medicine, clinical trials |
-| `--url` | direct fetch of one specific URL, skips search | Known-page retrieval only (never file downloads), full page text saved raw to its own report file (no quality filters) |
-| `--url-chrome` | direct fetch of one URL with real Google Chrome (provisioned repo-local into `tmp/browser/chrome/`) | Pages the cheaper tiers cannot reach — JS anti-bot gates, 403 or bot-wall responses. A fallback, never a first attempt: use it only after `--url` on that same URL clearly failed, or its automatic retry already ran. `--url` escalates to it on its own; either path provisions Chrome on first use |
-
 ## Key features
 
 - **30 results / up to 20 pages per query** via DuckDuckGo
