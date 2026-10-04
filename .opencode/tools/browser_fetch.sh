@@ -68,6 +68,29 @@ chrome_exe() {
 }
 chrome_ok() { local e; e="$(chrome_exe)"; [ -n "$e" ] && [ -x "$e" ]; }
 
+# The payload can be present yet fail to start — classically on Linux, where Chrome
+# needs system libraries that are NOT part of the repo-local payload (a container or
+# image recreate keeps the bind-mounted payload but wipes runtime-installed libs).
+# chrome_ok only proves the file exists; this proves it actually launches.
+chrome_runnable() {
+    local e; e="$(chrome_exe)"
+    [ -n "$e" ] && [ -x "$e" ] && "$e" --version >/dev/null 2>&1
+}
+
+install_chrome_deps() {
+    # Chrome's Linux system libraries. Called from install_chrome (first download) AND
+    # on their own whenever Chrome is present but cannot launch, so a payload that
+    # outlived its libraries re-heals instead of failing forever. A no-op off Linux or
+    # without root/apt (macOS/Windows payloads are self-contained).
+    [ "$(uname -s)" = "Linux" ] || return 0
+    if [ "$(id -u 2>/dev/null)" = "0" ] && command -v apt-get >/dev/null 2>&1; then
+        echo "Installing Google Chrome's system libraries ..." >&2
+        "$UV_BIN" run --no-project --with playwright playwright install-deps chromium >&2 || true
+        apt-get install -y --no-install-recommends libgtk-3-0 libxss1 >&2 || true
+    fi
+    return 0
+}
+
 install_chrome() {
     # Provision into a sibling staging dir and swap it in only on success: an
     # interrupted download/extract must never leave a payload that passes the
@@ -103,11 +126,7 @@ install_chrome() {
             mkdir -p "$stage"
             dpkg-deb -x "$deb" "$stage" || { rm -f "$deb"; rm -rf "$stage"; return 1; }
             rm -f "$deb"
-            # Chrome needs system libraries; add them when we may (containers run as root).
-            if [ "$(id -u 2>/dev/null)" = "0" ] && command -v apt-get >/dev/null 2>&1; then
-                "$UV_BIN" run --no-project --with playwright playwright install-deps chromium >&2 || true
-                apt-get install -y --no-install-recommends libgtk-3-0 libxss1 >&2 || true
-            fi
+            install_chrome_deps
             # Swap only once the extraction succeeded (a single rename — atomic on one fs).
             rm -rf "$CHROME_DIR"
             mv "$stage" "$CHROME_DIR" || { rm -rf "$stage"; return 1; }
@@ -158,6 +177,12 @@ if ! chrome_ok; then
             fi
         fi
     fi
+elif ! chrome_runnable; then
+    # The payload is there but cannot start — its system libraries are missing (e.g. a
+    # container recreate kept tmp/browser/ but wiped the runtime-installed libs).
+    # Reinstall them without re-downloading Chrome.
+    echo "note: Google Chrome is present but cannot launch — installing its system libraries" >&2
+    install_chrome_deps
 fi
 
 # --------------------------------------------------- graceful degradation (static --url)
@@ -170,10 +195,10 @@ for a in "$@"; do
     esac
 done
 
-# Provisioning-only mode: install the tier if it is missing, fetch nothing.
+# Provisioning-only mode: make the tier usable if it is not, fetch nothing.
 if [ "$ENSURE_ONLY" = "1" ]; then
-    if chrome_ok; then exit 0; fi
-    echo "note: Google Chrome is unavailable on this platform — browser tier not installed" >&2
+    if chrome_runnable; then exit 0; fi
+    echo "note: Google Chrome is unavailable or cannot launch on this platform — browser tier not usable" >&2
     exit 3
 fi
 
@@ -194,17 +219,17 @@ run_static_fallback() {
     return $rc
 }
 
-if ! chrome_ok; then
+if ! chrome_runnable; then
     if [ "$NO_FALLBACK" = "1" ]; then
-        echo "error: Google Chrome is not available (provisioning failed or unsupported platform)" >&2
+        echo "error: Google Chrome is unavailable or cannot launch (provisioning failed, unsupported platform, or its system libraries are missing)" >&2
         exit 3
     fi
     if [ ${#URLS[@]} -gt 0 ]; then
-        echo "note: Google Chrome is not available (provisioning failed or unsupported platform)" >&2
+        echo "note: Google Chrome is unavailable or cannot launch — serving the static fetch" >&2
         run_static_fallback
         exit $?
     fi
-    echo "error: Google Chrome is not available and no URL was given to fall back on" >&2
+    echo "error: Google Chrome is unavailable and no URL was given to fall back on" >&2
     exit 3
 fi
 

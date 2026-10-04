@@ -148,19 +148,25 @@ def _engine() -> dict:
     2026-10-01).
     """
     candidate = _provisioned_chrome()
-    if candidate is not None:
-        try:
-            out = subprocess.run([str(candidate), "--version"], capture_output=True,
-                                 text=True, timeout=20)
-            m = re.search(r"(\d+)\.\d+\.\d+\.\d+", out.stdout + out.stderr)
-            if m:
-                return {"path": str(candidate), "name": "Chrome", "origin": "tmp",
-                        "major": m.group(1)}
-        except Exception:  # noqa: BLE001
-            pass
+    if candidate is None:
+        raise RuntimeError(
+            "no provisioned Google Chrome in tmp/browser/chrome (a system browser is "
+            "never used; the wrapper installs the payload on first use)")
+    try:
+        out = subprocess.run([str(candidate), "--version"], capture_output=True,
+                             text=True, timeout=20)
+        m = re.search(r"(\d+)\.\d+\.\d+\.\d+", out.stdout + out.stderr)
+        if m:
+            return {"path": str(candidate), "name": "Chrome", "origin": "tmp",
+                    "major": m.group(1)}
+        detail = (out.stderr or out.stdout or "").strip().splitlines()
+        reason = detail[0][:160] if detail else f"exit status {out.returncode}"
+    except Exception as exc:  # noqa: BLE001
+        reason = f"{type(exc).__name__}: {exc}"[:160]
     raise RuntimeError(
-        "no provisioned Google Chrome in tmp/browser/chrome (a system browser is "
-        "never used; the wrapper installs the payload on first use)")
+        f"Google Chrome at {candidate} is present but failed to start ({reason}) — on "
+        "Linux its system libraries are likely missing; run browser_fetch.sh --ensure "
+        "to reinstall them")
 
 
 def _realistic_ua(major: str) -> str:
