@@ -14,14 +14,30 @@
 # libraries on Linux, which install_chrome() adds when it runs as root.
 #
 # Modes:
-#   <urls...>   fetch these pages with Chrome
-#   --ensure    provision the tier only, fetch nothing — exit 0 if Chrome is ready,
-#               3 if it is not. Used by web_research.py's --url preflight, which runs
-#               it BEFORE its wall-clock block (a first provisioning takes minutes).
+#   <urls...>       fetch these pages with Chrome
+#   --ensure        provision the tier only, fetch nothing — exit 0 if Chrome is ready,
+#                   3 if it is not. Used by web_research.py's --url preflight, which runs
+#                   it BEFORE its wall-clock block (a first provisioning takes minutes).
+#   --check-chrome  report the payload version against Google's current stable build and
+#                   exit 0 (current) / 3 (stale, absent, or unreadable) / 4 (Google's
+#                   version service unreachable, so the question cannot be answered).
+#                   Downloads nothing.
+#   --refresh-chrome  re-provision the payload from Google's stable channel and exit 0,
+#                   3 on failure. This is the only path that deletes a working payload.
+#   --ensure-fresh  --check-chrome + --refresh-chrome when it is stale; exit 0 when the
+#                   payload is current (also when staleness cannot be determined).
+#
+# The payload never updates itself: a fetch only provisions when none is present, so a
+# payload freezes at whatever build was current when it was first downloaded. That is what
+# --check-chrome / --refresh-chrome exist for — an unsandboxed browser several Chrome
+# releases behind stable is reachable exploit surface on the open web.
 #
 # Env:
 #   BROWSER_FETCH_NO_FALLBACK=1   never run the static fallback; exit 3 instead. Set by
 #               web_research.py's escalation, which already holds the static result.
+#   BROWSER_FETCH_NO_SANDBOX=1    launch Chrome without its sandbox (it is already off
+#               automatically as root, or when the Linux chrome-sandbox helper is not
+#               setuid root). browser_fetch.py passes chromiumSandbox accordingly.
 #
 #   tmp/uv/               uv itself (bootstrapped on first run, retried once)
 #   tmp/browser/chrome/   real Google Chrome (provisioned on first run)
@@ -160,7 +176,9 @@ acquire_lock() {
     return 0
 }
 
-if ! chrome_ok; then
+provision_with_lock() {
+    # One provisioning run per payload: the lock keeps two agents from unpacking into the
+    # same directory, and a held lock is waited out (then taken over once if it went stale).
     mkdir -p "$BROWSER_DIR"
     LOCK="$BROWSER_DIR/.chrome.lock"
     # shellcheck disable=SC2064
@@ -183,6 +201,88 @@ if ! chrome_ok; then
             fi
         fi
     fi
+}
+
+# ------------------------------------------------------------- payload freshness
+# The payload never updates itself: provisioning only runs when nothing is present, so a
+# payload freezes at the build that was stable when it was first downloaded. The version
+# comparison, the Google query and the freshness marker all live in browser_fetch.py, so
+# macOS, Linux and Windows apply exactly the same rule (and --check-chrome downloads
+# nothing, which is why it can run before provisioning).
+run_py() {
+    env -u PYTHONPATH PYTHONIOENCODING=utf-8 "$UV_BIN" run --no-project \
+        "$SCRIPT_DIR/browser_fetch.py" "$@"
+}
+
+record_payload() {
+    # Called after every successful provisioning run: without it a payload already at the
+    # newest downloadable build would be reported STALE forever while Google's channel API
+    # runs ahead of the rollout (and re-downloaded on every check).
+    run_py --record-payload >&2 || true
+}
+
+refresh_chrome() {
+    # The only path that deletes a working payload: a fetch path must never download
+    # hundreds of megabytes by surprise.
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            echo "error: provisioning on Windows belongs to browser_fetch.bat — run:" >&2
+            echo "       browser_fetch.bat --refresh-chrome" >&2
+            return 3
+            ;;
+    esac
+    echo "refreshing the Google Chrome payload in $CHROME_DIR ..." >&2
+    rm -rf "$CHROME_DIR"
+    provision_with_lock
+    if ! chrome_runnable; then
+        echo "error: the refreshed payload cannot launch" >&2
+        return 3
+    fi
+    record_payload
+    return 0
+}
+
+# --------------------------------------------------- modes (parsed before provisioning)
+# Parsed first so --check-chrome reports an absent payload instead of downloading one.
+URLS=()
+ENSURE_ONLY=0
+CHECK_ONLY=0
+REFRESH_ONLY=0
+ENSURE_FRESH=0
+for a in "$@"; do
+    case "$a" in
+        http://*|https://*) URLS+=("$a") ;;
+        --ensure) ENSURE_ONLY=1 ;;
+        --check-chrome) CHECK_ONLY=1 ;;
+        --refresh-chrome) REFRESH_ONLY=1 ;;
+        --ensure-fresh) ENSURE_FRESH=1 ;;
+    esac
+done
+
+if [ "$CHECK_ONLY" = "1" ]; then
+    run_py --check-chrome
+    exit $?
+fi
+
+if [ "$REFRESH_ONLY" = "1" ]; then
+    refresh_chrome
+    exit $?
+fi
+
+if [ "$ENSURE_FRESH" = "1" ]; then
+    # Staleness that cannot be determined (exit 4) never triggers a download: only a
+    # definite STALE does, so a transient API failure cannot cause a 443MB transfer.
+    run_py --check-chrome >&2
+    rc=$?
+    if [ "$rc" -eq 3 ]; then
+        refresh_chrome || exit 3
+    fi
+    exit 0
+fi
+
+if ! chrome_ok; then
+    provision_with_lock
+    chrome_ok && record_payload
 elif ! chrome_runnable; then
     # The payload is there but cannot start — its system libraries are missing (e.g. a
     # container recreate kept tmp/browser/ but wiped the runtime-installed libs).
@@ -190,16 +290,6 @@ elif ! chrome_runnable; then
     echo "note: Google Chrome is present but cannot launch — installing its system libraries" >&2
     install_chrome_deps
 fi
-
-# --------------------------------------------------- graceful degradation (static --url)
-URLS=()
-ENSURE_ONLY=0
-for a in "$@"; do
-    case "$a" in
-        http://*|https://*) URLS+=("$a") ;;
-        --ensure) ENSURE_ONLY=1 ;;
-    esac
-done
 
 # Provisioning-only mode: make the tier usable if it is not, fetch nothing.
 if [ "$ENSURE_ONLY" = "1" ]; then
@@ -240,7 +330,7 @@ if ! chrome_runnable; then
 fi
 
 # Run with inline dependencies (PEP 723 metadata in browser_fetch.py)
-env -u PYTHONPATH PYTHONIOENCODING=utf-8 "$UV_BIN" run --no-project "$SCRIPT_DIR/browser_fetch.py" "$@"
+run_py "$@"
 rc=$?
 # Exit 3 = the browser tier could not run at all (payload/libraries/download). A
 # blocked page (a refusal status; exit 2) is an honest result and is NOT re-fetched.

@@ -11,7 +11,15 @@ REM ORDINARY static --url path instead of failing.
 REM
 REM Modes:  <urls...>  fetch them with Chrome
 REM         --ensure   provision the tier only (no fetch); exit 0 if ready, 3 if not
+REM         --check-chrome   report the payload against Google's stable channel;
+REM                          exit 0 current, 3 stale/absent, 4 unknowable; no download
+REM         --refresh-chrome re-provision the payload from Google's stable channel
+REM         --ensure-fresh   check + refresh only when definitely stale
+REM The version comparison and the freshness marker live in browser_fetch.py, the same
+REM Python file macOS and Linux use, so all three platforms apply one rule.
 REM Env:    BROWSER_FETCH_NO_FALLBACK=1  never run the static fallback (exit 3 instead)
+REM         BROWSER_FETCH_NO_SANDBOX=1   launch Chrome without its sandbox (it is already
+REM                                      off automatically as root)
 
 setlocal enabledelayedexpansion
 
@@ -48,6 +56,28 @@ set "CHROME_STAGE=%BROWSER_DIR%\.stage-%RANDOM%%RANDOM%"
 set "CHROME_LOCK=%BROWSER_DIR%\.chrome.lock"
 
 call :detect_chrome
+
+REM ------------------------------------------- modes (parsed BEFORE provisioning)
+REM Parsed first so --check-chrome reports an absent payload instead of downloading one.
+set "CHECK_ONLY=0"
+set "REFRESH_ONLY=0"
+set "ENSURE_FRESH=0"
+echo %* | findstr /C:"--check-chrome" >nul 2>nul
+if not errorlevel 1 set "CHECK_ONLY=1"
+echo %* | findstr /C:"--refresh-chrome" >nul 2>nul
+if not errorlevel 1 set "REFRESH_ONLY=1"
+echo %* | findstr /C:"--ensure-fresh" >nul 2>nul
+if not errorlevel 1 set "ENSURE_FRESH=1"
+
+set "SCRIPT_PATH=%SCRIPT_DIR%\browser_fetch.py"
+set "SCRIPT_PATH=%SCRIPT_PATH:\=/%"
+set "PYTHONPATH="
+set PYTHONIOENCODING=utf-8
+
+if "%CHECK_ONLY%"=="1" goto :mode_check
+if "%REFRESH_ONLY%"=="1" goto :mode_refresh
+if "%ENSURE_FRESH%"=="1" goto :mode_ensure_fresh
+
 if not "%CHROME_OK%"=="0" goto :chrome_ready
 
 if not exist "%BROWSER_DIR%" mkdir "%BROWSER_DIR%"
@@ -76,11 +106,17 @@ goto :do_install
 call :install_chrome
 rmdir "%CHROME_LOCK%" 2>nul
 call :detect_chrome
-if not "%CHROME_OK%"=="0" goto :chrome_ready
+if "%CHROME_OK%"=="0" goto :do_install_retry
+call :record_payload
+goto :chrome_ready
+
+:do_install_retry
 echo Chrome verification failed; retrying once ...
 call :install_chrome
 rmdir "%CHROME_LOCK%" 2>nul
 call :detect_chrome
+if "%CHROME_OK%"=="0" goto :chrome_ready
+call :record_payload
 
 :chrome_ready
 REM ------------------------------------------------------------- URLs for fallback
@@ -203,3 +239,50 @@ exit /b %ERRORLEVEL%
 :download_ps
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-WebRequest -UseBasicParsing -Uri '%~1' -OutFile '%~2'"
 exit /b %ERRORLEVEL%
+
+REM ==========================================================================
+REM Payload freshness modes (all version logic lives in browser_fetch.py)
+REM ==========================================================================
+
+:mode_check
+REM Read-only: reports the payload against Google's stable channel and downloads
+REM nothing, so it is safe to run on a machine that has no payload at all.
+"%UV_DIR%\uv.exe" run --no-project "%SCRIPT_PATH%" --check-chrome
+exit /b %ERRORLEVEL%
+
+:mode_ensure_fresh
+REM exit 4 (staleness unknowable) never triggers a download: only a definite STALE does,
+REM so a transient API failure cannot cause a ~160MB transfer.
+"%UV_DIR%\uv.exe" run --no-project "%SCRIPT_PATH%" --check-chrome
+if errorlevel 4 exit /b 0
+if errorlevel 3 goto :mode_refresh
+exit /b 0
+
+:mode_refresh
+REM The only path that deletes a working payload. The cached offline installer is
+REM deleted too, otherwise :install_chrome would reuse it and deliver the same build.
+if not exist "%BROWSER_DIR%" mkdir "%BROWSER_DIR%"
+echo refreshing the Google Chrome payload in "%CHROME_DIR%" ...
+rmdir /s /q "%CHROME_DIR%" 2>nul
+del /q "%CHROME_SETUP%" 2>nul
+mkdir "%CHROME_LOCK%" 2>nul
+if not errorlevel 1 goto :mode_refresh_install
+rmdir "%CHROME_LOCK%" 2>nul
+mkdir "%CHROME_LOCK%" 2>nul
+:mode_refresh_install
+call :install_chrome
+rmdir "%CHROME_LOCK%" 2>nul
+call :detect_chrome
+if "%CHROME_OK%"=="0" (
+    echo error: the refreshed payload cannot launch
+    exit /b 3
+)
+call :record_payload
+echo chrome: refreshed
+exit /b 0
+
+:record_payload
+REM Writes tmp\browser\payload.txt (payload version, channel version, timestamp). Only
+REM called after a real provisioning run: recording without one would mask staleness.
+"%UV_DIR%\uv.exe" run --no-project "%SCRIPT_PATH%" --record-payload
+exit /b 0
