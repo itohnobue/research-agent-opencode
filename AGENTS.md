@@ -199,6 +199,8 @@ long gap or compaction — it is not assumed to persist.
 - With no report from this session, search normally.
 - When delegating to `@web-searcher`, pass the paths of the session reports that may cover the question — a subagent does not see this conversation, so a path you withhold is a page it will re-fetch.
 
+**Batch barrier (MANDATORY).** A spawn is not a completion: it returns before its agent has finished. After issuing spawns, call `await_subagents` with every session ID before replying, relaying a report, or starting any step; block until it reports `all_idle: true` (`N/N idle`). Only that ledger proves completion — a report file, a notification count, a progress message, or a clean `git status` never does. `status=missing` or `status=timeout` is an unresolved spawn: resume it, respawn it, or record the gap; never advance past it. Where the tool is unavailable (OpenCode V1), wait for each session's idle notice instead.
+
 For any internet search:
 
 1. Use the `@web-searcher` agent for comprehensive web research, or call the search tool directly via bash
