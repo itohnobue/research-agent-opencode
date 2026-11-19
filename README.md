@@ -1,6 +1,6 @@
 # Web Search Agent
 
-Deep web search for [OpenCode](https://opencode.ai) (v1 & v2). Requests up to 50 search results across several engines and fetches up to 20 pages per query by default — more depth than the typical 10-20 result limit of built-in tools — and delivers a one-line report pointer into an indexed report file you can read or grep.
+Deep web search for [OpenCode](https://opencode.ai) V2. Requests up to 50 search results across several engines and fetches up to 20 pages per query by default — more depth than the typical 10-20 result limit of built-in tools — and delivers a one-line report pointer into an indexed report file you can read or grep.
 
 ## Why use it
 
@@ -61,6 +61,7 @@ The API key is read from `provider.deepseek.options.apiKey` in `~/.config/openco
 
 ## Requirements
 
+- [OpenCode CLI](https://opencode.ai) — **V2 2.0+**
 - Python 3.11+ (managed by `uv`; downloaded into uv's cache if needed)
 - `pdftotext` (optional — from [poppler](https://poppler.freedesktop.org/); used when present for layout-aware PDF text. Without it, a bundled pure-Python extractor handles text PDFs — scanned pages and encrypted files still yield nothing)
 
